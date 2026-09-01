@@ -1,0 +1,45 @@
+# Build products
+/build*/
+/cmake-build*/
+/.tmp_*/
+CMakeCache.txt
+CMakeFiles/
+Testing/
+*.ninja
+.ninja_*
+compile_commands.json
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+
+# Generated simulation data
+*.bin
+*.npy
+*.npz
+trajectory*.txt
+checkpoint*.bin
+*.pf3d
+example-output/
+example-3d-output/
+initial_centres*.csv
+substrate.png
+*.log
+
+# Python and editor state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv-viz/
+.coverage
+.idea/
+.vscode/
+*.swp
+*~
+
+# Platform files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "Please cite this software."
+type: software
+title: "Phase-field cell simulator for NVIDIA GH200"
+version: 0.1.0
+date-released: 2026-08-31
+repository-code: "https://github.com/MetricManifold/phase-field-gh200"
+authors:
+  - family-names: Silber
+    given-names: "Steven A."
+  - family-names: Karttunen
+    given-names: Mikko
+license: LGPL-3.0-or-later
