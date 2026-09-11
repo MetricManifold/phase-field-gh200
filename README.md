@@ -57,12 +57,13 @@ All lengths are expressed in lattice units (`dx=dy=1`, and `dz=1` in 3D) and
 time in the solver's nondimensional integration unit. Parameters are therefore
 model-unit inputs; this repository does not imply a mapping to physical units.
 
-The normal update assigns one CUDA thread block per cell and keeps each active
-rectangular field in shared memory. An ordered second kernel handles only cells
-that outgrow those classes, reading phi and the interaction field from global
-memory without changing the equations or run-and-tumble stream. Every cell has
-a fixed `288 x 288` tile; the fallback uses its `286 x 286` interior at `(1,1)`.
-The interaction field is accumulated in Q5.27 fixed point.
+Each CUDA thread block takes one cell at a time from a shared work queue. The
+normal update keeps the active rectangular field in shared memory. Cells that
+outgrow those classes use global-memory reads in the same queue, allowing their
+longer updates to overlap work on other cells without changing the equations
+or run-and-tumble stream. Every cell has a fixed `288 x 288` tile; the fallback
+uses its `286 x 286` interior at `(1,1)`. The interaction field is accumulated
+in Q5.27 fixed point.
 
 Model reference: B. Palmieri, Y. Bresler, D. Wirtz, and M. Grant, “Multiple
 scale model for cell migration in monolayers: elastic mismatch between cells

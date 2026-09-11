@@ -153,16 +153,9 @@ __global__ __launch_bounds__(kBlockThreads, 1)
 void k_step(PF_GRID_CONSTANT const StepArgs A);
 
 __global__ __launch_bounds__(kBlockThreads, 1)
-void k_step_fallback(PF_GRID_CONSTANT const StepArgs A);
-
-__global__ __launch_bounds__(kBlockThreads, 1)
 void k_step_moments(PF_GRID_CONSTANT const StepArgs A);
 __global__ __launch_bounds__(kBlockThreads, 1)
-void k_step_fallback_moments(PF_GRID_CONSTANT const StepArgs A);
-__global__ __launch_bounds__(kBlockThreads, 1)
 void k_step_advection(PF_GRID_CONSTANT const StepArgs A);
-__global__ __launch_bounds__(kBlockThreads, 1)
-void k_step_fallback_advection(PF_GRID_CONSTANT const StepArgs A);
 
 __global__ void k_init_tiles(float* phi_a, float* phi_b, CellState* cell,
                              const uint8_t* cls, int N, int L,

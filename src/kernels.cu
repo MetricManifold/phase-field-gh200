@@ -1,6 +1,5 @@
-// CUDA kernels for the phase-field update. k_step handles shared-memory shape
-// classes; k_step_fallback immediately follows it for cells using the fixed
-// tile interior through global memory.
+// CUDA kernels for the phase-field update. One persistent queue handles every
+// cell, including the global-memory fallback, within the same step launch.
 
 #include "../include/kernels.cuh"
 #include "../include/fused_moments.cuh"
@@ -1005,32 +1004,18 @@ __device__ __forceinline__ void step_body(const StepArgs& A, char* smem)
             case kClassLarge:
                 dispatch_cell<kClassLarge, Spatial, AdvectionOnly>(n, A, smem, step);
                 break;
-            // The ordered fallback kernel advances cells whose input parity
-            // was written in the global-memory class.
-            case kClassFallback: __syncthreads(); break;
+            // Each queue entry owns one cell for the entire update. Processing
+            // fallback here overlaps its longer calculation with other cells;
+            // a class change cannot cause a second update in this step.
+            case kClassFallback:
+                process_cell_fallback<Spatial, AdvectionOnly>(n, A, smem, step);
+                break;
             default:
                 if (tid == 0) atomicAdd(&A.flags[FLAG_CLASS_UNSUPPORTED], 1u);
                 // Match process_cell's final barrier before reusing shared state.
                 __syncthreads();
                 break;
         }
-    }
-}
-
-// cls_written for the input parity is a stable source-class snapshot. A cell
-// promoted by k_step therefore cannot be advanced twice in the same step.
-template<bool Spatial, bool AdvectionOnly = false>
-__device__ __forceinline__ void fallback_body(const StepArgs& A, char* smem)
-{
-    const int input_parity = A.parity_out ^ 1;
-    const unsigned long long step = *A.step_rd;
-    for (int n = (int)blockIdx.x; n < A.N; n += (int)gridDim.x) {
-        const bool active =
-            A.cell[n].cls_written[input_parity] == (uint8_t)kClassFallback;
-        if (active)
-            process_cell_fallback<Spatial, AdvectionOnly>(n, A, smem, step);
-        else
-            __syncthreads();
     }
 }
 
@@ -1047,27 +1032,9 @@ void k_step_moments(PF_GRID_CONSTANT const StepArgs A) {
 }
 
 __global__ __launch_bounds__(kBlockThreads, 1)
-void k_step_fallback(PF_GRID_CONSTANT const StepArgs A) {
-    extern __shared__ uint4 smem_raw[];
-    fallback_body<false>(A, reinterpret_cast<char*>(smem_raw));
-}
-
-__global__ __launch_bounds__(kBlockThreads, 1)
-void k_step_fallback_moments(PF_GRID_CONSTANT const StepArgs A) {
-    extern __shared__ uint4 smem_raw[];
-    fallback_body<true>(A, reinterpret_cast<char*>(smem_raw));
-}
-
-__global__ __launch_bounds__(kBlockThreads, 1)
 void k_step_advection(PF_GRID_CONSTANT const StepArgs A) {
     extern __shared__ uint4 smem_raw[];
     step_body<false, true>(A, reinterpret_cast<char*>(smem_raw));
-}
-
-__global__ __launch_bounds__(kBlockThreads, 1)
-void k_step_fallback_advection(PF_GRID_CONSTANT const StepArgs A) {
-    extern __shared__ uint4 smem_raw[];
-    fallback_body<false, true>(A, reinterpret_cast<char*>(smem_raw));
 }
 
 __global__ void k_zero_u32(uint32_t* p, size_t n) {
@@ -1381,18 +1348,12 @@ void launch_step(const StepArgs& A, int grid, cudaStream_t stream,
     switch (observation) {
         case VelocityStep::Disabled:
             cudaLaunchKernelEx(&cfg, k_step, A);
-            cfg.dynamicSmemBytes = (size_t)kScalarBytes;
-            cudaLaunchKernelEx(&cfg, k_step_fallback, A);
             break;
         case VelocityStep::Advection:
             cudaLaunchKernelEx(&cfg, k_step_advection, A);
-            cfg.dynamicSmemBytes = (size_t)kScalarBytes;
-            cudaLaunchKernelEx(&cfg, k_step_fallback_advection, A);
             break;
         case VelocityStep::Spatial:
             cudaLaunchKernelEx(&cfg, k_step_moments, A);
-            cfg.dynamicSmemBytes = (size_t)kScalarBytes;
-            cudaLaunchKernelEx(&cfg, k_step_fallback_moments, A);
             break;
     }
 }

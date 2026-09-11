@@ -740,9 +740,9 @@ inline void print_params(const SimParams& p, int side, int pitch) {
     std::printf("  fallback class   %d: %d x %d at (1,1), phi and S global\n",
                 kClassFallback, kClasses[kClassFallback].wx,
                 kClasses[kClassFallback].wy);
-    std::printf("  step kernels     shared-class update then fallback filter "
-                "(%d threads; %d / %d B shared memory)\n",
-                kBlockThreads, kSmemBytes, kScalarBytes);
+    std::printf("  step kernels     one persistent queue for all classes "
+                "(%d threads; %d B shared memory)\n",
+                kBlockThreads, kSmemBytes);
 }
 
 }  // namespace pf

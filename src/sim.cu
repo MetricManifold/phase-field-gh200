@@ -249,14 +249,6 @@ bool Sim::configure_and_capture() {
             "budget. Check the ptxas spill-store report for the breakdown.\n",
             (size_t)fa.localSizeBytes, kLocalBytesBudget);
 
-    cudaFuncAttributes fallback_fa{};
-    CU_CHECK(cudaFuncGetAttributes(
-        &fallback_fa, reinterpret_cast<const void*>(k_step_fallback)));
-    std::printf("  k_step_fallback: %d regs, %zu B local frame/thread, "
-                "%d B static smem, %d B dynamic smem requested\n",
-                fallback_fa.numRegs, (size_t)fallback_fa.localSizeBytes,
-                (int)fallback_fa.sharedSizeBytes, kScalarBytes);
-
     print_path_report();
 
     // Reserve persisting L2 only when both hot S buffers fit; otherwise the
@@ -545,14 +537,11 @@ void Sim::print_path_report() const {
                                                  : "shared-memory-limited");
     };
 
-    std::printf("  step kernels: shared-class update then fallback filter "
-                "(two ordered launches per step)\n");
+    std::printf("  step kernels: all classes share one persistent queue "
+                "(one launch per step)\n");
     report("k_step", reinterpret_cast<const void*>(k_step),
            kBlockThreads, kSmemBytes, 1,
            kRegsPerSmSm90 / kBlockThreads);   // __launch_bounds__(768, 1)
-    report("fallback", reinterpret_cast<const void*>(k_step_fallback),
-           kBlockThreads, kScalarBytes, 1,
-           kRegsPerSmSm90 / kBlockThreads);
     if (velocity_.enabled() && !velocity_.reference()) {
         report("advection", reinterpret_cast<const void*>(k_step_advection),
                kBlockThreads, kSmemBytes, 1, kRegsPerSmSm90 / kBlockThreads);
