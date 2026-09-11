@@ -838,14 +838,23 @@ bool Sim::run() {
     const long long save_every = ckpt_on ? opt_.save_interval : 0;
     long long next_ckpt = ckpt_every > 0 ? steps_done_ + ckpt_every : total + 1;
     long long next_save = save_every > 0 ? steps_done_ + save_every : total + 1;
+    const bool boundary_on = !opt_.boundary_path.empty();
+    long long next_boundary = boundary_on ? steps_done_ + opt_.boundary_interval : total + 1;
+    long long last_boundary = -1;
     long long next_fatal_poll = steps_done_ + kFatalCheckPollEvery;
 
     if (!open_trajectory(opt_.out_path)) return false;
+    if (boundary_on) {
+        if (!boundary_.open(opt_.boundary_path, p_, side_, opt_.boundary_interval,
+                            opt_.boundary_compress) ||
+            !boundary_.capture(d_phi_[steps_done_%2], d_cell_, stream_, steps_done_, time())) return false;
+        last_boundary = steps_done_;
+    }
 
     while (steps_done_ < total) {
         const long long next_stop =
             std::min({total, ((steps_done_ / pi) + 1) * pi, next_traj,
-                      next_ckpt, next_save, next_fatal_poll});
+                      next_ckpt, next_save, next_fatal_poll, next_boundary});
 
         if (graph_ready_ && (steps_done_ % kGraphBody) == 0 &&
             steps_done_ + kGraphBody <= next_stop) {
@@ -860,9 +869,10 @@ bool Sim::run() {
         const bool do_traj  = !opt_.out_path.empty() && steps_done_ >= next_traj;
         const bool do_ckpt  = ckpt_every > 0 && steps_done_ >= next_ckpt;
         const bool do_save  = save_every > 0 && steps_done_ >= next_save;
+        const bool do_boundary = boundary_on && steps_done_ >= next_boundary;
         const bool do_fatal_poll = steps_done_ >= next_fatal_poll;
 
-        if (do_print || do_traj || do_ckpt || do_save || do_fatal_poll) {
+        if (do_print || do_traj || do_ckpt || do_save || do_fatal_poll || do_boundary) {
             CU_WARN(cudaStreamSynchronize(stream_));
             if (fatal_flag_set()) {
                 run_failed = true;
@@ -881,6 +891,14 @@ bool Sim::run() {
                     break;
                 }
                 next_traj = next_interval_boundary(steps_done_, traj_every);
+            }
+            if (do_boundary) {
+                if (!boundary_.capture(d_phi_[steps_done_%2], d_cell_, stream_, steps_done_, time())) {
+                    run_failed = true;
+                    break;
+                }
+                last_boundary = steps_done_;
+                next_boundary = steps_done_ + opt_.boundary_interval;
             }
             // One gather feeds both files when both fall due on the same step.
             if (do_ckpt || do_save) {
@@ -923,6 +941,11 @@ bool Sim::run() {
                     traj_frames_, p_.num_cells);
     if (!close_trajectory())
         run_failed = true;
+    if (boundary_on) {
+        if (!run_failed && last_boundary != steps_done_ &&
+            !boundary_.capture(d_phi_[steps_done_%2], d_cell_, stream_, steps_done_, time())) run_failed = true;
+        if (!boundary_.close()) run_failed = true;
+    }
     // Preserve the last accepted rolling checkpoint when a fatal state occurs.
     if (ckpt_on && (opt_.final_checkpoint || run_failed)) {
         std::vector<std::string> final_paths;

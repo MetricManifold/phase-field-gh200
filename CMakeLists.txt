@@ -31,7 +31,7 @@ endif()
 # counter for fields whose detected support reaches an active-window edge.
 option(PF_DIAGNOSTIC_ALARMS
        "Enable the high-frequency support-edge counter" OFF)
-option(PF_BUILD_TOOLS "Build initializer tools" ON)
+option(PF_BUILD_TOOLS "Build initializer and boundary-export tools" ON)
 option(PF_BUILD_3D "Build the separate three-dimensional simulator" ON)
 option(PF_ENABLE_CHECKPOINT_IO_TESTS
   "Register checkpoint I/O tests that stage through any CUDA device without launching kernels" OFF)
@@ -71,7 +71,17 @@ add_library(pf_core STATIC
   src/kernels.cu
   src/sim.cu
   src/checkpoint.cu
-  src/trajectory.cpp)
+  src/trajectory.cpp
+  src/boundary.cu)
+find_package(Threads REQUIRED)
+target_link_libraries(pf_core PRIVATE Threads::Threads)
+find_path(PF_ZSTD_INCLUDE_DIR zstd.h)
+find_library(PF_ZSTD_LIBRARY NAMES zstd libzstd)
+if(PF_ZSTD_INCLUDE_DIR AND PF_ZSTD_LIBRARY)
+  target_include_directories(pf_core PRIVATE ${PF_ZSTD_INCLUDE_DIR})
+  target_link_libraries(pf_core PRIVATE ${PF_ZSTD_LIBRARY})
+  target_compile_definitions(pf_core PRIVATE PF_BOUNDARY_ZSTD=1)
+endif()
 target_link_libraries(pf_core PUBLIC pf_shape_config)
 target_include_directories(pf_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -175,6 +185,13 @@ if(PF_BUILD_3D)
 endif()
 
 if(PF_BUILD_TOOLS)
+  add_executable(boundary_export tools/boundary_export.cu)
+  target_link_libraries(boundary_export PRIVATE pf_core)
+  target_compile_options(boundary_export PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+  set_target_properties(boundary_export PROPERTIES
+    CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+  pf_enable_warnings(boundary_export)
   if(PF_HOST_NO_CONTRACTION_KNOWN)
     add_executable(palmieri_centres tools/palmieri_centres.cpp)
     target_include_directories(palmieri_centres PRIVATE
@@ -198,6 +215,45 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+  add_executable(pf2d_boundary_output_test tests/boundary_output_test.cu)
+  target_link_libraries(pf2d_boundary_output_test PRIVATE pf_core)
+  target_compile_options(pf2d_boundary_output_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+  set_target_properties(pf2d_boundary_output_test PROPERTIES
+    CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+  if(PF_ZSTD_INCLUDE_DIR AND PF_ZSTD_LIBRARY)
+    target_include_directories(pf2d_boundary_output_test PRIVATE ${PF_ZSTD_INCLUDE_DIR})
+    target_link_libraries(pf2d_boundary_output_test PRIVATE ${PF_ZSTD_LIBRARY})
+    target_compile_definitions(pf2d_boundary_output_test PRIVATE PF_BOUNDARY_ZSTD=1)
+  endif()
+  pf_enable_warnings(pf2d_boundary_output_test)
+
+  foreach(boundary_case missing_interval missing_path codec bench zero_interval bad_codec)
+    set(boundary_diagnostic "[fatal] boundary output requires a path and interval, and cannot be used with --bench")
+    if(boundary_case STREQUAL "missing_interval")
+      set(boundary_args --boundary-out test.pfb)
+    elseif(boundary_case STREQUAL "missing_path")
+      set(boundary_args --boundary-interval 1000)
+    elseif(boundary_case STREQUAL "codec")
+      set(boundary_args --boundary-compression zstd)
+    elseif(boundary_case STREQUAL "bench")
+      set(boundary_args --boundary-out test.pfb --boundary-interval 1000 --bench 10)
+    elseif(boundary_case STREQUAL "zero_interval")
+      set(boundary_args --boundary-out test.pfb --boundary-interval 0)
+      set(boundary_diagnostic "[fatal] --boundary-interval: expected an integer in [1, 1000000000000], got '0'")
+    else()
+      set(boundary_args --boundary-compression invalid)
+      set(boundary_diagnostic "[fatal] boundary compression must be none or zstd")
+    endif()
+    add_test(NAME pf2d_boundary_cli_${boundary_case}
+      COMMAND ${CMAKE_COMMAND}
+        -DEXE=$<TARGET_FILE:cell_gh200>
+        "-DCASE_ARGS=${boundary_args}"
+        -DEXPECT_CODE=2
+        "-DEXPECT_LINE=${boundary_diagnostic}"
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/3d/run_cli_case.cmake)
+  endforeach()
 
   add_executable(common_primitives_cpu_test
     tests/common_primitives_cpu_test.cpp)
@@ -334,6 +390,8 @@ if(BUILD_TESTING)
   endif()
 
   if(PF_ENABLE_GPU_TESTS)
+    add_test(NAME pf2d_boundary_output COMMAND pf2d_boundary_output_test)
+    set_tests_properties(pf2d_boundary_output PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     add_test(NAME gh200_smoke
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gpu_smoke.py
@@ -351,6 +409,9 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS cell_gh200 RUNTIME DESTINATION bin)
+if(TARGET boundary_export)
+  install(TARGETS boundary_export RUNTIME DESTINATION bin)
+endif()
 if(TARGET cell_gh200_3d)
   install(TARGETS cell_gh200_3d RUNTIME DESTINATION bin)
 endif()

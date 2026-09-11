@@ -5,6 +5,7 @@
 #include "checkpoint.cuh"
 #include "kernels.cuh"
 #include "params.cuh"
+#include "boundary.cuh"
 
 #include <csignal>
 #include <cstdio>
@@ -36,6 +37,9 @@ struct RunOptions {
     int  traj_samples  = 100;     // evenly spaced samples across the run
     long long traj_interval = 0;  // steps between samples; overrides traj_samples
     std::string out_path;
+    std::string boundary_path;
+    long long boundary_interval = 0; // disabled unless explicitly requested
+    bool boundary_compress = false;
     // Fresh starts only; empty selects the built-in grid-and-jitter placement.
     std::string initial_centres_path;
 
@@ -132,6 +136,7 @@ private:
     bool open_trajectory(const std::string& path);
     bool append_trajectory_frame(long long step_at);
     bool close_trajectory();
+    BoundaryOutput boundary_;
 };
 
 }  // namespace pf

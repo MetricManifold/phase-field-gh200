@@ -23,6 +23,7 @@ compile_commands.json
 trajectory*.txt
 checkpoint*.bin
 *.pf3d
+*.pfb
 example-output/
 example-3d-output/
 initial_centres*.csv

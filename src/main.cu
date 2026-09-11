@@ -62,6 +62,9 @@ static void usage(const char* argv0) {
 "  --out <path>           plain-text trajectory output\n"
 "  --trajectory-samples <int>  evenly spaced trajectory frames         (100)\n"
 "  --trajectory-interval <int> steps between frames (overrides samples)\n"
+"  --boundary-out <path>  new compact half-height boundary file (optional)\n"
+"  --boundary-interval <int>  steps between boundary frames; required with output\n"
+"  --boundary-compression <none|zstd>  lossless compression (none)\n"
 "  --self-test            run coefficient, RNG, and force-sign checks\n"
 "  -h, --help             this message\n"
 "\n"
@@ -416,6 +419,23 @@ int main(int argc, char** argv) {
             if (!parse_i(a, need(), &iv, 1, 1000000000)) return 2;
             opt.traj_interval = (long long)iv;
             trajectory_interval_supplied = true;
+        } else if (!std::strcmp(a, "--boundary-out")) {
+            opt.boundary_path = need();
+            if (opt.boundary_path.empty()) {
+                std::fprintf(stderr, "[fatal] --boundary-out requires a non-empty path\n");
+                return 2;
+            }
+        } else if (!std::strcmp(a, "--boundary-interval")) {
+            if (!parse_i(a, need(), &iv, 1, 1000000000000LL)) return 2;
+            opt.boundary_interval = iv;
+        } else if (!std::strcmp(a, "--boundary-compression")) {
+            const char* codec = need();
+            if (!std::strcmp(codec, "none")) opt.boundary_compress = false;
+            else if (!std::strcmp(codec, "zstd")) opt.boundary_compress = true;
+            else {
+                std::fprintf(stderr, "[fatal] boundary compression must be none or zstd\n");
+                return 2;
+            }
         } else if (!std::strcmp(a, "--full-moment")) {
             if (!parse_i(a, need(), &iv, 0, 1000000000)) return 2;
             p.full_moment_every = (int)iv;
@@ -445,6 +465,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[fatal] unknown option '%s' (try --help)\n", a);
             return 2;
         }
+    }
+    if (opt.boundary_path.empty() != (opt.boundary_interval == 0) ||
+        (opt.boundary_compress && opt.boundary_path.empty()) ||
+        (!opt.boundary_path.empty() && opt.bench_steps > 0)) {
+        std::fprintf(stderr, "[fatal] boundary output requires a path and interval, and cannot be used with --bench\n");
+        return 2;
     }
     // Load a stored state or construct a fresh initial condition.
     CheckpointData ckpt;

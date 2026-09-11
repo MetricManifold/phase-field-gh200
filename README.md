@@ -89,6 +89,15 @@ of [Chiang *et al.*, *Physical Review E* 110, 044403
 (2024)](https://doi.org/10.1103/PhysRevE.110.044403). Slab height must be shown
 not to affect observables before the geometry is used for scientific results.
 
+## Optional 2D boundary output
+
+`--boundary-out boundaries.pfb --boundary-interval 1000` saves compact field
+samples for offline contour and neighbour-exchange analysis. Output is disabled
+by default; it does not detect T1 events inside the solver. The interval is in
+integration steps, not trajectory frames. `--boundary-compression zstd` enables
+lossless compression when CMake finds libzstd. Use a new output file for each
+restart segment. See [the format and usage notes](docs/boundary-output.md).
+
 ## Requirements
 
 - A CUDA 12.x toolkit and NVIDIA GPU supporting the requested CUDA architecture;
