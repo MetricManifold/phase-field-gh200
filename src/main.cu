@@ -3,6 +3,7 @@
 #include "../include/checkpoint.cuh"
 #include "../include/params.cuh"
 #include "../include/sim.cuh"
+#include "../include/output_file.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -65,6 +66,10 @@ static void usage(const char* argv0) {
 "  --boundary-out <path>  new compact half-height boundary file (optional)\n"
 "  --boundary-interval <int>  steps between boundary frames; required with output\n"
 "  --boundary-compression <none|zstd>  lossless compression (none)\n"
+"  --velocity-moments <path>  new PFVMOM4 velocity-component output\n"
+"  --velocity-spatial-stride <int>  spatial measurement stride, 1..1000 (100)\n"
+"  --velocity-dense-start <int>  initial densely measured steps (10000)\n"
+"  --velocity-moments-reference  independent dense observer for validation\n"
 "  --self-test            run coefficient, RNG, and force-sign checks\n"
 "  -h, --help             this message\n"
 "\n"
@@ -321,6 +326,7 @@ int main(int argc, char** argv) {
     bool no_final_ckpt = false;
     bool trajectory_samples_supplied = false;
     bool trajectory_interval_supplied = false;
+    bool velocity_options_supplied = false;
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -419,6 +425,20 @@ int main(int argc, char** argv) {
             if (!parse_i(a, need(), &iv, 1, 1000000000)) return 2;
             opt.traj_interval = (long long)iv;
             trajectory_interval_supplied = true;
+        } else if (!std::strcmp(a, "--velocity-moments")) {
+            opt.velocity.path = need();
+            velocity_options_supplied = true;
+        } else if (!std::strcmp(a, "--velocity-spatial-stride")) {
+            if (!parse_i(a, need(), &iv, 1, 1000)) return 2;
+            opt.velocity.spatial_stride = (int)iv;
+            velocity_options_supplied = true;
+        } else if (!std::strcmp(a, "--velocity-dense-start")) {
+            if (!parse_i(a, need(), &iv, 0, 1000000000)) return 2;
+            opt.velocity.dense_start = iv;
+            velocity_options_supplied = true;
+        } else if (!std::strcmp(a, "--velocity-moments-reference")) {
+            opt.velocity.reference = true;
+            velocity_options_supplied = true;
         } else if (!std::strcmp(a, "--boundary-out")) {
             opt.boundary_path = need();
             if (opt.boundary_path.empty()) {
@@ -472,6 +492,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[fatal] boundary output requires a path and interval, and cannot be used with --bench\n");
         return 2;
     }
+    if (velocity_options_supplied &&
+        (opt.velocity.path.empty() || (opt.out_path.empty() && opt.bench_steps == 0))) {
+        std::fprintf(stderr,
+            "[fatal] velocity recording requires --velocity-moments and --out "
+            "(--bench measures the observer without writing files)\n");
+        return 2;
+    }
+    if (!distinct_output_paths({opt.out_path, opt.boundary_path, opt.velocity.path}))
+        return 2;
     // Load a stored state or construct a fresh initial condition.
     CheckpointData ckpt;
     if (!ckpt_in.empty()) {
@@ -524,6 +553,11 @@ int main(int argc, char** argv) {
             const std::filesystem::path dir = src.parent_path();
             opt.ckpt_dir = dir.empty() ? std::string(".") : dir.string();
         }
+        // Checkpoint replacement must not unlink a live observation stream.
+        if (!distinct_output_paths({opt.out_path, opt.boundary_path, opt.velocity.path,
+                                     opt.ckpt_dir + "/checkpoint.bin",
+                                     opt.ckpt_dir + "/checkpoint_failed.bin"}))
+            return 2;
         std::error_code ec;
         std::filesystem::create_directories(opt.ckpt_dir, ec);
         if (ec) {

@@ -1,5 +1,6 @@
 #include "../include/boundary.cuh"
 #include "../common/boundary_format.h"
+#include "output_file.hpp"
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -9,13 +10,6 @@
 #include <mutex>
 #include <thread>
 #include <vector>
-#include <fcntl.h>
-#ifdef _WIN32
-#include <io.h>
-#include <sys/stat.h>
-#else
-#include <unistd.h>
-#endif
 #ifdef PF_BOUNDARY_ZSTD
 #include <zstd.h>
 #endif
@@ -78,7 +72,7 @@ __global__ void count_squares(const float* phi, const CellState* cells,
         const double y = (double)c.gy0 + c.Cy/c.V;
         m.cx = (float)(x - floor(x/side)*side);
         m.cy = (float)(y - floor(y/side)*side);
-        m.gamma = c.gamma; m.mobility = 0.5f; // fixed M in the public 2D model
+        m.gamma = c.gamma; m.mobility = (float)kPhaseFieldMobility;
         m.active_speed = c.v_A; m.radius = c.R_tgt;
         m.squares = invalid[0] ? UINT32_MAX : counts[0];
         meta[i] = m;
@@ -111,21 +105,6 @@ uint64_t checksum(const unsigned char* p, size_t n) {
     uint64_t h = 14695981039346656037ull;
     for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
     return h;
-}
-std::FILE* create_exclusive(const std::string& path) {
-#ifdef _WIN32
-    const int fd = _open(path.c_str(), _O_WRONLY|_O_CREAT|_O_EXCL|_O_BINARY,
-                         _S_IREAD|_S_IWRITE);
-    if (fd < 0) return nullptr;
-    std::FILE* fp = _fdopen(fd, "wb");
-    if (!fp) _close(fd);
-#else
-    const int fd = ::open(path.c_str(), O_WRONLY|O_CREAT|O_EXCL, 0666);
-    if (fd < 0) return nullptr;
-    std::FILE* fp = fdopen(fd, "wb");
-    if (!fp) ::close(fd);
-#endif
-    return fp;
 }
 } // namespace
 
@@ -321,7 +300,7 @@ bool BoundaryOutput::open(const std::string& path, const SimParams& p, int side,
     b.meta.resize(b.n); b.offsets.resize(b.n);
     BCU(cudaMalloc((void**)&b.d_meta, b.n*sizeof(boundary::Cell)));
     BCU(cudaMalloc((void**)&b.d_offsets, b.n*sizeof(uint64_t)));
-    b.fp = create_exclusive(path);
+    b.fp = open_new_binary_file(path);
     if (!b.fp) { std::perror("[boundary] cannot create new output file"); return false; }
     boundary::FileHeader h{};
     std::memcpy(h.magic, "PFBND01", 8);

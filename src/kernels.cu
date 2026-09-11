@@ -3,6 +3,7 @@
 // tile interior through global memory.
 
 #include "../include/kernels.cuh"
+#include "../include/fused_moments.cuh"
 
 #include <cuda_pipeline.h>
 
@@ -50,7 +51,7 @@ __device__ __forceinline__ uint32_t morton2d(uint32_t x, uint32_t y) {
 // Most shared-memory classes stage both phi and aggregate S. Class 4 stages
 // only phi, reads S globally, and temporarily stores phi_next globally before
 // the moment/scatter pass.
-template <int CLS>
+template <int CLS, bool Spatial, bool AdvectionOnly = false>
 __device__ void process_cell(int n, const StepArgs& A, char* smem,
                              unsigned long long step)
 {
@@ -184,6 +185,7 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
         bci[19] = tumbled;
         bci[20] = dwx;            bci[21] = dwy;
         bci[22] = dtx0;           bci[23] = dty0;
+        if constexpr (Spatial) velocity::broadcast_geometry(bcf, cs);
     }
 
     for (int i = tid; i < kRing; i += kBlockThreads) {
@@ -244,7 +246,9 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
         ++committed;
     }
 
+    velocity::RelaxMoments<Spatial> observer(bcf);
     double aIx = 0.0, aIy = 0.0;
+    double aBetaX = 0.0, aBetaY = 0.0;
     for (int s = 0; s < NS; ++s) {
         // Strip s's stencil needs row 16(s+1), i.e. strip s+1's first row.
         // With the prologue depth held at 3, exactly one group may remain
@@ -279,6 +283,13 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
             const float gy = 0.5f * (pN - pS);
             aIx += (double)(c * gx * So);
             aIy += (double)(c * gy * So);
+            if constexpr (Spatial) {
+                aBetaX += (double)c * pE;
+                aBetaY += (double)c * pN;
+                observer.pixel(i, y, c, pE, pW, pN, pS,
+                               p[PX+1], p[PX-1], p[-PX+1], p[-PX-1],
+                               So, bcf[8], bcf[9], A.rep_coeff);
+            }
         }
 
         if (committed < NS) { issue_strip(committed); __pipeline_commit(); ++committed; }
@@ -289,10 +300,18 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
     for (int d = 16; d > 0; d >>= 1) {
         aIx += __shfl_down_sync(0xFFFFFFFFu, aIx, d);
         aIy += __shfl_down_sync(0xFFFFFFFFu, aIy, d);
+        if constexpr (Spatial) {
+            aBetaX += __shfl_down_sync(0xFFFFFFFFu, aBetaX, d);
+            aBetaY += __shfl_down_sync(0xFFFFFFFFu, aBetaY, d);
+        }
     }
     if (lane == 0) {
         red_s[warp * kRedSlots + 0] = aIx;
         red_s[warp * kRedSlots + 1] = aIy;
+        if constexpr (Spatial) {
+            red_s[warp * kRedSlots + 2] = aBetaX;
+            red_s[warp * kRedSlots + 3] = aBetaY;
+        }
     }
     __syncthreads();
     if (tid == 0) {
@@ -314,8 +333,11 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
         CellState* cs = &A.cell[n];
         cs->vx = (float)vxd;  cs->vy = (float)vyd;
         cs->Ix = sIx;         cs->Iy = sIy;
+        velocity::record_advection<Spatial || AdvectionOnly, Spatial>(
+            A, n, bcf, red_s, sIx, sIy);
     }
     __syncthreads();
+    observer.finish(A, n, red_s);
 
     // The non-staged path writes output here, so class-change zeroing must occur
     // first. The branch is block-uniform because bci[7] is broadcast.
@@ -568,8 +590,17 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
     __syncthreads();   // smem is reused by the next cell in this CTA
 }
 
+// Keep the infrequent spatial path out of the register budget of the
+// per-step advection specialization; validated with ptxas and H100 timing.
+template<int CLS>
+__device__ __noinline__ void process_cell_moments(int n, const StepArgs& A, char* smem,
+                                                unsigned long long step) {
+    process_cell<CLS, true>(n, A, smem, step);
+}
+
 // Rare whole-tile fallback. The active 286x286 window reads phi and S from
 // global memory; tile rows and columns 0 and 287 remain the stencil zero ring.
+template<bool Spatial, bool AdvectionOnly = false>
 __device__ __noinline__ void process_cell_fallback(
     int n, const StepArgs& A, char* smem, unsigned long long step)
 {
@@ -672,6 +703,7 @@ __device__ __noinline__ void process_cell_fallback(
         bci[17] = fm; bci[18] = (int)pctr; bci[19] = tumbled;
         bci[20] = dwx; bci[21] = dwy; bci[22] = dc.tx0; bci[23] = dc.ty0;
         bci[24] = no_margin;
+        if constexpr (Spatial) velocity::broadcast_geometry(bcf, cs);
     }
     __syncthreads();
 
@@ -679,7 +711,9 @@ __device__ __noinline__ void process_cell_fallback(
     const int split = min(WX, A.L - gx0);
     const float* tile_in = A.phi_in + (size_t)n * kTileArea;
 
+    velocity::RelaxMoments<Spatial> observer(bcf);
     double aIx = 0.0, aIy = 0.0;
+    double aBetaX = 0.0, aBetaY = 0.0;
     for (int y = warp; y < WY; y += kWarpsPerBlock) {
         int gy = gy0 + y;
         if (gy >= A.L) gy -= A.L;
@@ -693,16 +727,32 @@ __device__ __noinline__ void process_cell_fallback(
                                      c, A.flags);
             aIx += (double)(c * gx * So);
             aIy += (double)(c * gy_phi * So);
+            if constexpr (Spatial) {
+                aBetaX += (double)c * p[1];
+                aBetaY += (double)c * p[kTilePitch];
+                observer.pixel(x, y, c, p[1], p[-1], p[kTilePitch], p[-kTilePitch],
+                               p[kTilePitch+1], p[kTilePitch-1],
+                               p[-kTilePitch+1], p[-kTilePitch-1],
+                               So, bcf[8], bcf[9], A.rep_coeff);
+            }
         }
     }
 #pragma unroll
     for (int d = 16; d > 0; d >>= 1) {
         aIx += __shfl_down_sync(0xFFFFFFFFu, aIx, d);
         aIy += __shfl_down_sync(0xFFFFFFFFu, aIy, d);
+        if constexpr (Spatial) {
+            aBetaX += __shfl_down_sync(0xFFFFFFFFu, aBetaX, d);
+            aBetaY += __shfl_down_sync(0xFFFFFFFFu, aBetaY, d);
+        }
     }
     if (lane == 0) {
         red_s[warp * kRedSlots] = aIx;
         red_s[warp * kRedSlots + 1] = aIy;
+        if constexpr (Spatial) {
+            red_s[warp * kRedSlots + 2] = aBetaX;
+            red_s[warp * kRedSlots + 3] = aBetaY;
+        }
     }
     __syncthreads();
     if (tid == 0) {
@@ -719,8 +769,11 @@ __device__ __noinline__ void process_cell_fallback(
         CellState* cs = &A.cell[n];
         cs->vx = (float)vxd; cs->vy = (float)vyd;
         cs->Ix = sIx; cs->Iy = sIy;
+        velocity::record_advection<Spatial || AdvectionOnly, Spatial>(
+            A, n, bcf, red_s, sIx, sIy);
     }
     __syncthreads();
+    observer.finish(A, n, red_s);
 
     float* tile_out = A.phi_out + (size_t)n * kTileArea;
     if (bci[7]) {
@@ -880,12 +933,18 @@ __device__ __noinline__ void process_cell_fallback(
     __syncthreads();
 }
 
-__global__ __launch_bounds__(kBlockThreads, 1)
-void k_step(PF_GRID_CONSTANT const StepArgs A)
+template<int CLS, bool Spatial, bool AdvectionOnly>
+__device__ __forceinline__ void dispatch_cell(
+    int n, const StepArgs& A, char* smem, unsigned long long step) {
+    if constexpr (Spatial)
+        process_cell_moments<CLS>(n, A, smem, step);
+    else
+        process_cell<CLS, false, AdvectionOnly>(n, A, smem, step);
+}
+
+template<bool Spatial, bool AdvectionOnly = false>
+__device__ __forceinline__ void step_body(const StepArgs& A, char* smem)
 {
-    // uint4 provides the 16-byte alignment required by cp.async destinations.
-    extern __shared__ uint4 smem_raw[];
-    char* smem = reinterpret_cast<char*>(smem_raw);
     int* ctrl = reinterpret_cast<int*>(smem + kRedBytes);
 
     const int tid = (int)threadIdx.x;
@@ -931,11 +990,21 @@ void k_step(PF_GRID_CONSTANT const StepArgs A)
         static_assert(kNumClasses == 6,
                       "k_step's dispatch switch must enumerate every class");
         switch (cls) {
-            case kClassRound: process_cell<kClassRound>(n, A, smem, step); break;
-            case kClassWide:  process_cell<kClassWide >(n, A, smem, step); break;
-            case kClassTall:  process_cell<kClassTall >(n, A, smem, step); break;
-            case kClassBig:   process_cell<kClassBig  >(n, A, smem, step); break;
-            case kClassLarge: process_cell<kClassLarge>(n, A, smem, step); break;
+            case kClassRound:
+                dispatch_cell<kClassRound, Spatial, AdvectionOnly>(n, A, smem, step);
+                break;
+            case kClassWide:
+                dispatch_cell<kClassWide, Spatial, AdvectionOnly>(n, A, smem, step);
+                break;
+            case kClassTall:
+                dispatch_cell<kClassTall, Spatial, AdvectionOnly>(n, A, smem, step);
+                break;
+            case kClassBig:
+                dispatch_cell<kClassBig, Spatial, AdvectionOnly>(n, A, smem, step);
+                break;
+            case kClassLarge:
+                dispatch_cell<kClassLarge, Spatial, AdvectionOnly>(n, A, smem, step);
+                break;
             // The ordered fallback kernel advances cells whose input parity
             // was written in the global-memory class.
             case kClassFallback: __syncthreads(); break;
@@ -950,21 +1019,55 @@ void k_step(PF_GRID_CONSTANT const StepArgs A)
 
 // cls_written for the input parity is a stable source-class snapshot. A cell
 // promoted by k_step therefore cannot be advanced twice in the same step.
-__global__ __launch_bounds__(kBlockThreads, 1)
-void k_step_fallback(PF_GRID_CONSTANT const StepArgs A)
+template<bool Spatial, bool AdvectionOnly = false>
+__device__ __forceinline__ void fallback_body(const StepArgs& A, char* smem)
 {
-    extern __shared__ uint4 smem_raw[];
-    char* smem = reinterpret_cast<char*>(smem_raw);
     const int input_parity = A.parity_out ^ 1;
     const unsigned long long step = *A.step_rd;
     for (int n = (int)blockIdx.x; n < A.N; n += (int)gridDim.x) {
         const bool active =
             A.cell[n].cls_written[input_parity] == (uint8_t)kClassFallback;
         if (active)
-            process_cell_fallback(n, A, smem, step);
+            process_cell_fallback<Spatial, AdvectionOnly>(n, A, smem, step);
         else
             __syncthreads();
     }
+}
+
+__global__ __launch_bounds__(kBlockThreads, 1)
+void k_step(PF_GRID_CONSTANT const StepArgs A) {
+    extern __shared__ uint4 smem_raw[];
+    step_body<false>(A, reinterpret_cast<char*>(smem_raw));
+}
+
+__global__ __launch_bounds__(kBlockThreads, 1)
+void k_step_moments(PF_GRID_CONSTANT const StepArgs A) {
+    extern __shared__ uint4 smem_raw[];
+    step_body<true>(A, reinterpret_cast<char*>(smem_raw));
+}
+
+__global__ __launch_bounds__(kBlockThreads, 1)
+void k_step_fallback(PF_GRID_CONSTANT const StepArgs A) {
+    extern __shared__ uint4 smem_raw[];
+    fallback_body<false>(A, reinterpret_cast<char*>(smem_raw));
+}
+
+__global__ __launch_bounds__(kBlockThreads, 1)
+void k_step_fallback_moments(PF_GRID_CONSTANT const StepArgs A) {
+    extern __shared__ uint4 smem_raw[];
+    fallback_body<true>(A, reinterpret_cast<char*>(smem_raw));
+}
+
+__global__ __launch_bounds__(kBlockThreads, 1)
+void k_step_advection(PF_GRID_CONSTANT const StepArgs A) {
+    extern __shared__ uint4 smem_raw[];
+    step_body<false, true>(A, reinterpret_cast<char*>(smem_raw));
+}
+
+__global__ __launch_bounds__(kBlockThreads, 1)
+void k_step_fallback_advection(PF_GRID_CONSTANT const StepArgs A) {
+    extern __shared__ uint4 smem_raw[];
+    fallback_body<false, true>(A, reinterpret_cast<char*>(smem_raw));
 }
 
 __global__ void k_zero_u32(uint32_t* p, size_t n) {
@@ -1228,11 +1331,16 @@ __global__ void k_morton_sort(const CellState* cell, uint32_t* perm,
 }
 
 void configure_k_step_smem() {
-    cudaFuncSetAttribute(reinterpret_cast<const void*>(k_step),
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         kSmemBytes);
-    cudaFuncSetAttribute(reinterpret_cast<const void*>(k_step),
-                         cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    const void* kernels[] = {
+        reinterpret_cast<const void*>(k_step),
+        reinterpret_cast<const void*>(k_step_advection),
+        reinterpret_cast<const void*>(k_step_moments)};
+    for (const void* kernel : kernels) {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             kSmemBytes);
+        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             100);
+    }
 }
 
 void configure_morton_smem(int smem_bytes) {
@@ -1248,7 +1356,7 @@ int k_step_grid(int device) {
 }
 
 void launch_step(const StepArgs& A, int grid, cudaStream_t stream,
-                 const void* l2_base, size_t l2_bytes, float l2_hit_ratio)
+                 const void* l2_base, size_t l2_bytes, float l2_hit_ratio, VelocityStep observation)
 {
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3((unsigned)grid, 1, 1);
@@ -1270,9 +1378,23 @@ void launch_step(const StepArgs& A, int grid, cudaStream_t stream,
     cfg.attrs = nattr ? attr : nullptr;
     cfg.numAttrs = (unsigned)nattr;
 
-    cudaLaunchKernelEx(&cfg, k_step, A);
-    cfg.dynamicSmemBytes = (size_t)kScalarBytes;
-    cudaLaunchKernelEx(&cfg, k_step_fallback, A);
+    switch (observation) {
+        case VelocityStep::Disabled:
+            cudaLaunchKernelEx(&cfg, k_step, A);
+            cfg.dynamicSmemBytes = (size_t)kScalarBytes;
+            cudaLaunchKernelEx(&cfg, k_step_fallback, A);
+            break;
+        case VelocityStep::Advection:
+            cudaLaunchKernelEx(&cfg, k_step_advection, A);
+            cfg.dynamicSmemBytes = (size_t)kScalarBytes;
+            cudaLaunchKernelEx(&cfg, k_step_fallback_advection, A);
+            break;
+        case VelocityStep::Spatial:
+            cudaLaunchKernelEx(&cfg, k_step_moments, A);
+            cfg.dynamicSmemBytes = (size_t)kScalarBytes;
+            cudaLaunchKernelEx(&cfg, k_step_fallback_moments, A);
+            break;
+    }
 }
 
 // Query occupancy after configuring dynamic shared memory. Report the driver's

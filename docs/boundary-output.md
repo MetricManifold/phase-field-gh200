@@ -56,6 +56,21 @@ Storage grows with the number of cells, run duration and sampling frequency.
 Estimate the bytes per frame from a representative pilot and check the user
 quota before a production run. Ordinary checkpoint output remains separate.
 
+## Pairing with velocity components
+
+Add --velocity-moments velocity.bin to save the corresponding component
+integrals, with frames at the trajectory cadence. Match records by integer
+integration step and stable cell ID; use the header timestep to express time.
+Boundary cadence is relative to the start of each invocation, while trajectory
+cadence is aligned to absolute integration steps. Their first and final frames
+coincide; intermediate frames coincide when the cadences and restart offset
+align. Do not pair records by row number or interpolate a T1 event time without
+retaining its sampling bracket.
+
+Both recorders use independent files and can be enabled separately. T1
+detection remains offline. See [velocity output](velocity-output.md) for its
+channel definitions, numerical limitations and validated reader.
+
 ## Exporting saved fields
 
 `boundary_export CHECKPOINT_OR_DIRECTORY NEW_OUTPUT [zstd]` exports existing

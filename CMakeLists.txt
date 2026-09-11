@@ -72,6 +72,9 @@ add_library(pf_core STATIC
   src/sim.cu
   src/checkpoint.cu
   src/trajectory.cpp
+  src/output_file.cpp
+  src/velocity_moments.cu
+  src/velocity_output.cu
   src/boundary.cu)
 find_package(Threads REQUIRED)
 target_link_libraries(pf_core PRIVATE Threads::Threads)
@@ -215,6 +218,34 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+  add_executable(pf2d_velocity_math_test tests/velocity_math_test.cpp)
+  target_include_directories(pf2d_velocity_math_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/common ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  pf_enable_warnings(pf2d_velocity_math_test)
+  add_test(NAME pf2d_velocity_math COMMAND pf2d_velocity_math_test)
+  add_test(NAME pf2d_velocity_cli
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/velocity_cli_test.py
+      $<TARGET_FILE:cell_gh200>)
+  add_test(NAME pf2d_velocity_reader
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/velocity_reader_test.py)
+
+  if(PF_ENABLE_GPU_TESTS)
+    add_executable(pf2d_velocity_observer_test tests/velocity_observer_test.cu)
+    target_link_libraries(pf2d_velocity_observer_test PRIVATE pf_core)
+    target_compile_options(pf2d_velocity_observer_test PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+    set_target_properties(pf2d_velocity_observer_test PROPERTIES
+      CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+    pf_enable_warnings(pf2d_velocity_observer_test)
+    add_test(NAME pf2d_velocity_observer
+      COMMAND pf2d_velocity_observer_test --synthetic)
+    set_tests_properties(pf2d_velocity_observer PROPERTIES TIMEOUT 180)
+    add_test(NAME pf2d_observation_output
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/observation_output_test.py
+        --executable $<TARGET_FILE:cell_gh200>)
+    set_tests_properties(pf2d_observation_output PROPERTIES TIMEOUT 300)
+  endif()
 
   add_executable(pf2d_boundary_output_test tests/boundary_output_test.cu)
   target_link_libraries(pf2d_boundary_output_test PRIVATE pf_core)
@@ -425,6 +456,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tools/relaxed_2d_to_slab_centres.py)
   install(PROGRAMS tools/relaxed_2d_to_slab_centres.py DESTINATION bin)
 endif()
 install(PROGRAMS tools/render_pf3d_slab.py DESTINATION bin)
+install(PROGRAMS tools/velocity_moments.py DESTINATION bin)
 install(FILES tools/pf3d_checkpoint_header.py DESTINATION bin)
 install(FILES
   README.md

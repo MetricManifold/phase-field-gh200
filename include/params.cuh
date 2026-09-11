@@ -14,6 +14,7 @@
 namespace pf {
 
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kPhaseFieldMobility = 0.5;
 
 // Physics: Palmieri et al. 2015, Sci Rep 5:11745, Eq. (S15). Mobility M = 1/2.
 // The coefficient helpers include the mobility factor and return the values

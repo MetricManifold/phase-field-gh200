@@ -5,10 +5,12 @@
 
 #include "params.cuh"
 #include "philox.cuh"
+#include "velocity_moments.h"
 
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 #if defined(__CUDACC__) && defined(CUDART_VERSION) && (CUDART_VERSION >= 11070)
@@ -43,10 +45,14 @@ struct alignas(64) CellState {
     // reserved[0] records whether fallback storage was used; reserved[1]
     // counts fallback cell-steps without a support margin. Both diagnostics
     // are cumulative within a run and are not checkpointed.
-    uint32_t reserved[18];
+    uint32_t reserved[2];
+    velocity::AdvectionAccum advection; // runtime-only observer state
+    uint32_t reserved_unused[2];
 };
 static_assert(sizeof(CellState) == 192, "CellState must be exactly 192 B");
 static_assert(alignof(CellState) == 64, "CellState must be 64 B aligned");
+static_assert(offsetof(CellState, advection) == 128, "observer storage moved");
+static_assert(offsetof(CellState, reserved) == 120, "diagnostic storage moved");
 
 // Compact trajectory record written to mapped host-pinned memory on GH200.
 struct TrajPackedCell {
@@ -78,6 +84,10 @@ struct StepArgs {
     const unsigned long long* step_rd;
     unsigned long long* step_wr;
     uint32_t*       flags;
+
+    // Null when recording is disabled or the independent oracle is used.
+    velocity::MomentAccum* moments;
+    double physical_dt; // unrounded integration interval for observation
 
     // Geometry.
     int N;
@@ -145,6 +155,15 @@ void k_step(PF_GRID_CONSTANT const StepArgs A);
 __global__ __launch_bounds__(kBlockThreads, 1)
 void k_step_fallback(PF_GRID_CONSTANT const StepArgs A);
 
+__global__ __launch_bounds__(kBlockThreads, 1)
+void k_step_moments(PF_GRID_CONSTANT const StepArgs A);
+__global__ __launch_bounds__(kBlockThreads, 1)
+void k_step_fallback_moments(PF_GRID_CONSTANT const StepArgs A);
+__global__ __launch_bounds__(kBlockThreads, 1)
+void k_step_advection(PF_GRID_CONSTANT const StepArgs A);
+__global__ __launch_bounds__(kBlockThreads, 1)
+void k_step_fallback_advection(PF_GRID_CONSTANT const StepArgs A);
+
 __global__ void k_init_tiles(float* phi_a, float* phi_b, CellState* cell,
                              const uint8_t* cls, int N, int L,
                              const float* seed_cx, const float* seed_cy,
@@ -174,13 +193,17 @@ __global__ void k_pack_traj(const CellState* cell, const uint8_t* cls,
 __global__ void k_morton_sort(const CellState* cell, uint32_t* perm,
                               int N, int M, int L);
 
+// Observation mode selects a compile-time kernel specialization.
+enum class VelocityStep { Disabled, Advection, Spatial };
+
 // Host-side launchers.
 void configure_k_step_smem();                // cudaFuncSetAttribute opt-in
 void configure_morton_smem(int smem_bytes);
 int  k_step_grid(int device);                 // = numSMs
 
 void launch_step(const StepArgs& A, int grid, cudaStream_t stream,
-                 const void* l2_base, size_t l2_bytes, float l2_hit_ratio);
+                 const void* l2_base, size_t l2_bytes, float l2_hit_ratio,
+                 VelocityStep observation = VelocityStep::Disabled);
 
 
 // Resource and occupancy values from the CUDA runtime. Configure the dynamic

@@ -1,10 +1,11 @@
 // Host orchestration for initialization, ordered CUDA updates, checkpointing,
-// and diagnostics. A six-step graph covers the two phi buffers and three
-// aggregate-field buffers.
+// and diagnostics. Captured graphs cover the two phi buffers, three
+// aggregate-field buffers, and optional spatial-observation cadence.
 
 #include "../include/sim.cuh"
 #include "../include/palmieri_initializer.hpp"
 #include "../include/trajectory.hpp"
+#include "../include/velocity_moments.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -54,8 +55,12 @@ long long next_interval_boundary(long long current, long long interval) {
 
 Sim::~Sim() {
     if (traj_fp_) (void)close_trajectory();
-    if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
-    if (graph_)      cudaGraphDestroy(graph_);
+    (void)velocity_.close();
+    (void)boundary_.close();
+    for (const auto& graph : graphs_) {
+        if (graph.executable) cudaGraphExecDestroy(graph.executable);
+        if (graph.graph) cudaGraphDestroy(graph.graph);
+    }
     if (stream_)     cudaStreamDestroy(stream_);
     cudaFree(d_phi_[0]);
     cudaFree(d_phi_[1]);
@@ -219,6 +224,7 @@ bool Sim::alloc_device(const SimParams& p, const RunOptions& opt, int device) {
 bool Sim::configure_and_capture() {
     const int N = p_.num_cells;
     const long long total = p_.total_steps();
+    if (!velocity_.configure(opt_.velocity, N, p_.dt)) return false;
     trajectory_every_ = opt_.traj_interval > 0
         ? opt_.traj_interval
         : std::max<long long>(1, total / std::max(1, opt_.traj_samples));
@@ -547,9 +553,15 @@ void Sim::print_path_report() const {
     report("fallback", reinterpret_cast<const void*>(k_step_fallback),
            kBlockThreads, kScalarBytes, 1,
            kRegsPerSmSm90 / kBlockThreads);
+    if (velocity_.enabled() && !velocity_.reference()) {
+        report("advection", reinterpret_cast<const void*>(k_step_advection),
+               kBlockThreads, kSmemBytes, 1, kRegsPerSmSm90 / kBlockThreads);
+        report("spatial", reinterpret_cast<const void*>(k_step_moments),
+               kBlockThreads, kSmemBytes, 1, kRegsPerSmSm90 / kBlockThreads);
+    }
 }
 
-// Per-slot argument baking. slot in [0, 6): phi parity = slot % 2, S rotation
+// Per-slot argument baking: phi parity = slot % 2, S rotation
 // slot = slot % 3, cursor and step-counter slots follow the phi parity.
 StepArgs Sim::args_for_slot(int slot) const {
     const int pin  = slot % 2;
@@ -570,6 +582,8 @@ StepArgs Sim::args_for_slot(int slot) const {
     A.step_rd = d_step_ + pin;
     A.step_wr = d_step_ + pout;
     A.flags = d_flags_;
+    A.moments = velocity_.reference() ? nullptr : velocity_.accumulators();
+    A.physical_dt = p_.dt;
 
     A.N = p_.num_cells;
     A.L = side_;
@@ -619,7 +633,7 @@ void Sim::l2_window_for_slot(int slot, const void** base, size_t* bytes,
     return;
 }
 
-void Sim::launch_one(int slot) {
+void Sim::launch_one(int slot, bool capturing) {
     if (opt_.morton && (slot % kMortonEvery) == 0) {
         int M = 1;
         while (M < p_.num_cells) M <<= 1;
@@ -628,19 +642,35 @@ void Sim::launch_one(int slot) {
     }
     const void* base = nullptr; size_t nb = 0; float hit = 0.0f;
     l2_window_for_slot(slot, &base, &nb, &hit);
-    launch_step(args_for_slot(slot), grid_, stream_, base, nb, hit);
+    const StepArgs args = args_for_slot(slot);
+    VelocityStep observation = VelocityStep::Disabled;
+    if (velocity_.enabled()) {
+        if (velocity_.reference()) {
+            launch_velocity_moments(args, velocity_.accumulators(), p_.dt, stream_);
+        } else {
+            observation = velocity_.sampling().spatial_sample(slot, steps_done_, capturing)
+                ? VelocityStep::Spatial : VelocityStep::Advection;
+        }
+    }
+    launch_step(args, grid_, stream_, base, nb, hit, observation);
+    if (!capturing) velocity_.sampling().advanced();
 }
 
 bool Sim::build_graph() {
-    CU_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
-    for (int s = 0; s < kGraphBody; ++s) launch_one(s);
-    CU_CHECK(cudaStreamEndCapture(stream_, &graph_));
-    CU_CHECK(cudaGraphInstantiateWithFlags(&graph_exec_, graph_, 0));
+    const auto& sampling = velocity_.sampling();
+    const int steps = sampling.graph_steps();
+    graphs_.resize(sampling.graph_count());
+    for (int phase = 0; phase < sampling.graph_count(); ++phase) {
+        auto& graph = graphs_[phase];
+        CU_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
+        for (int s = 0; s < steps; ++s) launch_one(phase * steps + s, true);
+        CU_CHECK(cudaStreamEndCapture(stream_, &graph.graph));
+        CU_CHECK(cudaGraphInstantiateWithFlags(&graph.executable, graph.graph, 0));
+    }
     graph_ready_ = true;
-    std::printf("  CUDA graph: %d-step body captured, %d kernel nodes (lcm of 2 "
-                "phi parities and 3 S rotation slots)%s\n", kGraphBody,
-                2 * kGraphBody,
-                opt_.morton ? " + Morton sort at slot 0" : "");
+    std::printf("  CUDA graphs: %d x %d steps cover phi parity, S rotation, "
+                "and observation cadence%s\n", sampling.graph_count(), steps,
+                opt_.morton ? "; Morton sort every six steps" : "");
     return true;
 }
 
@@ -808,6 +838,8 @@ bool Sim::verify(double* max_rel_V, float* max_outside, uint32_t* max_S) {
 
 bool Sim::run() {
     const long long total = p_.total_steps();
+    const int graph_period = velocity_.sampling().graph_period();
+    const int graph_steps = velocity_.sampling().graph_steps();
     const long long pi = p_.print_interval > 0 ? p_.print_interval : total;
     bool run_failed = false;
 
@@ -840,28 +872,25 @@ bool Sim::run() {
     long long next_save = save_every > 0 ? steps_done_ + save_every : total + 1;
     const bool boundary_on = !opt_.boundary_path.empty();
     long long next_boundary = boundary_on ? steps_done_ + opt_.boundary_interval : total + 1;
-    long long last_boundary = -1;
     long long next_fatal_poll = steps_done_ + kFatalCheckPollEvery;
 
     if (!open_trajectory(opt_.out_path)) return false;
-    if (boundary_on) {
-        if (!boundary_.open(opt_.boundary_path, p_, side_, opt_.boundary_interval,
-                            opt_.boundary_compress) ||
-            !boundary_.capture(d_phi_[steps_done_%2], d_cell_, stream_, steps_done_, time())) return false;
-        last_boundary = steps_done_;
-    }
+    if (!open_observations()) return false;
 
     while (steps_done_ < total) {
         const long long next_stop =
             std::min({total, ((steps_done_ / pi) + 1) * pi, next_traj,
                       next_ckpt, next_save, next_fatal_poll, next_boundary});
 
-        if (graph_ready_ && (steps_done_ % kGraphBody) == 0 &&
-            steps_done_ + kGraphBody <= next_stop) {
-            CU_WARN(cudaGraphLaunch(graph_exec_, stream_));
-            steps_done_ += kGraphBody;
+        if (graph_ready_ && velocity_.sampling().can_replay(steps_done_) &&
+            (steps_done_ % graph_steps) == 0 &&
+            steps_done_ + graph_steps <= next_stop) {
+            const auto& graph = graphs_[velocity_.sampling().graph_index(steps_done_)];
+            CU_WARN(cudaGraphLaunch(graph.executable, stream_));
+            steps_done_ += graph_steps;
+            velocity_.sampling().advanced();
         } else {
-            launch_one((int)(steps_done_ % kGraphBody));
+            launch_one((int)(steps_done_ % graph_period));
             steps_done_ += 1;
         }
 
@@ -892,12 +921,11 @@ bool Sim::run() {
                 }
                 next_traj = next_interval_boundary(steps_done_, traj_every);
             }
+            if (!capture_observations(do_traj, do_boundary)) {
+                run_failed = true;
+                break;
+            }
             if (do_boundary) {
-                if (!boundary_.capture(d_phi_[steps_done_%2], d_cell_, stream_, steps_done_, time())) {
-                    run_failed = true;
-                    break;
-                }
-                last_boundary = steps_done_;
                 next_boundary = steps_done_ + opt_.boundary_interval;
             }
             // One gather feeds both files when both fall due on the same step.
@@ -941,11 +969,7 @@ bool Sim::run() {
                     traj_frames_, p_.num_cells);
     if (!close_trajectory())
         run_failed = true;
-    if (boundary_on) {
-        if (!run_failed && last_boundary != steps_done_ &&
-            !boundary_.capture(d_phi_[steps_done_%2], d_cell_, stream_, steps_done_, time())) run_failed = true;
-        if (!boundary_.close()) run_failed = true;
-    }
+    if (!close_observations(!run_failed)) run_failed = true;
     // Preserve the last accepted rolling checkpoint when a fatal state occurs.
     if (ckpt_on && (opt_.final_checkpoint || run_failed)) {
         std::vector<std::string> final_paths;
@@ -968,18 +992,20 @@ bool Sim::run() {
 }
 
 bool Sim::bench(int steps, double* ms_per_step) {
+    const int graph_period = velocity_.sampling().graph_period();
+    const int graph_steps = velocity_.sampling().graph_steps();
     // Warm-up: fill caches, resolve the first graph upload, settle clocks.
     const int warm = std::min(steps, 200);
-    for (int i = 0; i < warm; ++i) { launch_one((int)(steps_done_ % kGraphBody)); ++steps_done_; }
+    for (int i = 0; i < warm; ++i) { launch_one((int)(steps_done_ % graph_period)); ++steps_done_; }
     CU_CHECK(cudaStreamSynchronize(stream_));
 
     cudaEvent_t e0, e1;
     CU_CHECK(cudaEventCreate(&e0));
     CU_CHECK(cudaEventCreate(&e1));
 
-    // Align to a graph-body boundary so the timed region is pure graph replay.
-    while ((steps_done_ % kGraphBody) != 0) {
-        launch_one((int)(steps_done_ % kGraphBody));
+    // Align to a graph boundary so the timed region is pure graph replay.
+    while ((steps_done_ % graph_steps) != 0) {
+        launch_one((int)(steps_done_ % graph_period));
         ++steps_done_;
     }
     CU_CHECK(cudaStreamSynchronize(stream_));
@@ -988,10 +1014,12 @@ bool Sim::bench(int steps, double* ms_per_step) {
     CU_CHECK(cudaEventRecord(e0, stream_));
     while (steps_done_ - timed_from < steps) {
         if (graph_ready_) {
-            CU_CHECK(cudaGraphLaunch(graph_exec_, stream_));
-            steps_done_ += kGraphBody;
+            const auto& graph = graphs_[velocity_.sampling().graph_index(steps_done_)];
+            CU_CHECK(cudaGraphLaunch(graph.executable, stream_));
+            steps_done_ += graph_steps;
+            velocity_.sampling().advanced();
         } else {
-            launch_one((int)(steps_done_ % kGraphBody));
+            launch_one((int)(steps_done_ % graph_period));
             steps_done_ += 1;
         }
     }
@@ -1015,6 +1043,42 @@ bool Sim::bench(int steps, double* ms_per_step) {
 }
 
 volatile std::sig_atomic_t Sim::s_terminate = 0;
+
+bool Sim::open_observations() {
+    if (!velocity_.open(args_for_slot(int(steps_done_ % kGraphBody)), steps_done_, stream_))
+        return false;
+    if (opt_.boundary_path.empty()) return true;
+    return boundary_.open(opt_.boundary_path, p_, side_, opt_.boundary_interval,
+                           opt_.boundary_compress) &&
+           capture_observations(false, true);
+}
+
+bool Sim::capture_observations(bool velocity, bool boundary) {
+    if (velocity && velocity_.enabled() &&
+        !velocity_.capture(args_for_slot(int(steps_done_ % kGraphBody)), steps_done_, stream_))
+        return false;
+    if (boundary) {
+        if (!boundary_.capture(d_phi_[steps_done_ % 2], d_cell_, stream_,
+                                steps_done_, time())) return false;
+        last_boundary_ = steps_done_;
+    }
+    return true;
+}
+
+bool Sim::close_observations(bool valid_state) {
+    bool ok = true;
+    if (valid_state) {
+        const bool velocity_due = velocity_.enabled() &&
+                                  velocity_.last_frame() != steps_done_;
+        const bool boundary_due = !opt_.boundary_path.empty() &&
+                                  last_boundary_ != steps_done_;
+        ok = capture_observations(velocity_due, boundary_due);
+    }
+    // Always close both streams, even if capture or one close fails.
+    if (!velocity_.close()) ok = false;
+    if (!boundary_.close()) ok = false;
+    return ok;
+}
 
 bool Sim::open_trajectory(const std::string& path) {
     if (path.empty()) return true;

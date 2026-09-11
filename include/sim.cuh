@@ -6,6 +6,7 @@
 #include "kernels.cuh"
 #include "params.cuh"
 #include "boundary.cuh"
+#include "velocity_output.cuh"
 
 #include <csignal>
 #include <cstdio>
@@ -16,7 +17,7 @@ namespace pf {
 
 // Six graph steps cover both phase-field buffer parities and all three
 // shared-field rotation slots.
-constexpr int kGraphBody = 6;
+constexpr int kGraphBody = VelocitySampling::kPhysicsPeriod;
 constexpr int kMortonEvery = kGraphBody;   // aligned to the graph body
 // Maximum interval between host checks of fatal device flags.
 constexpr long long kFatalCheckPollEvery = 10000;
@@ -37,6 +38,7 @@ struct RunOptions {
     int  traj_samples  = 100;     // evenly spaced samples across the run
     long long traj_interval = 0;  // steps between samples; overrides traj_samples
     std::string out_path;
+    VelocityOptions velocity;
     std::string boundary_path;
     long long boundary_interval = 0; // disabled unless explicitly requested
     bool boundary_compress = false;
@@ -44,7 +46,7 @@ struct RunOptions {
     std::string initial_centres_path;
 
     // Empty ckpt_dir disables all checkpoints. Cadences use elapsed-step
-    // thresholds because a graph replay advances by kGraphBody steps.
+    // thresholds because a graph replay advances multiple physical steps.
     std::string ckpt_dir;
     long long ckpt_interval = 0;  // steps between rolling <dir>/checkpoint.bin
     long long save_interval = 0;  // steps between tagged checkpoint_%08d.bin
@@ -86,7 +88,7 @@ private:
     StepArgs args_for_slot(int slot) const;
     void     l2_window_for_slot(int slot, const void** base, size_t* bytes,
                                 float* hit) const;
-    void     launch_one(int slot);
+    void     launch_one(int slot, bool capturing = false);
     void     print_path_report() const;
     bool     build_graph();
     bool     seed_positions(std::vector<float>& cx, std::vector<float>& cy,
@@ -119,8 +121,11 @@ private:
     TrajPackedCell* d_traj_ = nullptr;         // device alias of h_traj_
 
     cudaStream_t stream_ = nullptr;
-    cudaGraph_t  graph_  = nullptr;
-    cudaGraphExec_t graph_exec_ = nullptr;
+    struct CapturedGraph {
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+    };
+    std::vector<CapturedGraph> graphs_;
     bool graph_ready_ = false;
     bool fallback_reported_ = false;
     bool fallback_no_margin_reported_ = false;
@@ -137,6 +142,11 @@ private:
     bool append_trajectory_frame(long long step_at);
     bool close_trajectory();
     BoundaryOutput boundary_;
+    long long last_boundary_ = -1;
+    VelocityOutput velocity_;
+    bool open_observations();
+    bool capture_observations(bool velocity, bool boundary);
+    bool close_observations(bool valid_state);
 };
 
 }  // namespace pf

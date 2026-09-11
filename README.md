@@ -89,7 +89,16 @@ of [Chiang *et al.*, *Physical Review E* 110, 044403
 (2024)](https://doi.org/10.1103/PhysRevE.110.044403). Slab height must be shown
 not to affect observables before the geometry is used for scientific results.
 
-## Optional 2D boundary output
+## Optional 2D observations
+
+`--velocity-moments velocity.bin` records the active, interaction, interfacial,
+overlap, area and discrete-advection contributions to centroid motion. Exact
+per-step advection integrals are combined with spatial measurements every
+100 steps after 10000 densely measured startup steps. The spatial integrals
+use a discrete linear correction; sampling accuracy must be checked for the
+intended dynamics. Velocity frames follow the trajectory cadence and include
+the invocation's initial and final states. See
+[the component definitions, format and reader](docs/velocity-output.md).
 
 `--boundary-out boundaries.pfb --boundary-interval 1000` saves compact field
 samples for offline contour and neighbour-exchange analysis. Output is disabled
@@ -97,6 +106,11 @@ by default; it does not detect T1 events inside the solver. The interval is in
 integration steps, not trajectory frames. `--boundary-compression zstd` enables
 lossless compression when CMake finds libzstd. Use a new output file for each
 restart segment. See [the format and usage notes](docs/boundary-output.md).
+
+Both recorders can run together. Their integer integration steps and stable
+cell IDs join the outputs; each has its own explicit file format and sampling
+policy. The original update specialization runs when velocity recording is
+disabled, and neither recorder changes the model or checkpoint schema.
 
 ## Requirements
 
