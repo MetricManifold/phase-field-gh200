@@ -1,5 +1,7 @@
 #include "../../include/pf3d/sim.cuh"
 #include "../../include/pf3d/measure_shards.hpp"
+#include "../../include/pf3d/update_shards.hpp"
+#include "../../include/pf3d/brick_classes.hpp"
 #include "../../include/pf3d/trajectory_header.hpp"
 #include "../../include/pf3d/reference.hpp"
 #include "../../include/palmieri_initializer.hpp"
@@ -24,9 +26,8 @@ constexpr std::size_t kAllocationReserve = 256u * 1024u * 1024u;
 constexpr int kHostPollEvery = 16;
 constexpr int kMaximumShiftPerStep = 4;
 constexpr int kPhaseEventSlots = 7;
-// Promoted cubes contain many more tiles than base bricks. When only a few
-// cells are promoted, wider spatial sharding exposes enough independent work
-// to occupy the device.
+// Promoted measurement uses a fixed-stride partial-moment workspace. Fast
+// updates have no reduction workspace and need not share this limit.
 constexpr int kMaximumPromotedShards = 64;
 
 bool gpu_ok(cudaError_t status, const char* operation) {
@@ -47,34 +48,6 @@ bool multiply_bytes(std::size_t a, std::size_t b, std::size_t* out) {
     return checked_mul_size(a, b, out);
 }
 
-bool copy_centered_cube(float* destination, int destination_edge,
-                        const float* source, int source_edge,
-                        cudaStream_t stream) {
-    if (destination == nullptr || source == nullptr ||
-        destination_edge < source_edge ||
-        (destination_edge - source_edge) % 2 != 0)
-        return false;
-    const int offset = (destination_edge - source_edge) / 2;
-    cudaMemcpy3DParms copy{};
-    copy.srcPtr = make_cudaPitchedPtr(
-        const_cast<float*>(source),
-        static_cast<std::size_t>(source_edge) * sizeof(float),
-        source_edge, source_edge);
-    copy.dstPtr = make_cudaPitchedPtr(
-        destination,
-        static_cast<std::size_t>(destination_edge) * sizeof(float),
-        destination_edge, destination_edge);
-    copy.dstPos = make_cudaPos(
-        static_cast<std::size_t>(offset) * sizeof(float),
-        static_cast<std::size_t>(offset),
-        static_cast<std::size_t>(offset));
-    copy.extent = make_cudaExtent(
-        static_cast<std::size_t>(source_edge) * sizeof(float),
-        source_edge, source_edge);
-    copy.kind = cudaMemcpyDeviceToDevice;
-    return gpu_ok(cudaMemcpy3DAsync(&copy, stream),
-                  "center adaptive phase field");
-}
 
 bool any_fatal_flag(const std::vector<std::uint32_t>& flags) {
     for (int i = 0; i < FLAG3D_COUNT; ++i)
@@ -188,7 +161,12 @@ bool parse_storage_mode(const std::string& text, StorageMode3D* mode) {
 
 Sim3D::~Sim3D() {
     close_trajectory();
+    cudaSetDevice(options_.device);
     if (stream_) cudaStreamSynchronize(stream_);
+    if (boundary_output_) {
+        boundary_output_->close(false);
+        boundary_output_.reset();
+    }
     clear_phase_events();
     if (bench_start_) cudaEventDestroy(bench_start_);
     if (bench_stop_) cudaEventDestroy(bench_stop_);
@@ -208,6 +186,7 @@ Sim3D::~Sim3D() {
         for (float* field : table)
             if (field) cudaFree(field);
     if (d_promoted_ids_) cudaFree(d_promoted_ids_);
+    if (d_owned_promoted_ids_) cudaFree(d_owned_promoted_ids_);
     for (float** table : d_promoted_phi_)
         if (table) cudaFree(table);
     if (d_scratch_) cudaFree(d_scratch_);
@@ -227,6 +206,17 @@ bool Sim3D::allocate(const SimParams3D& params,
                      std::optional<int> checkpoint_measure_shards) {
     params_ = params;
     options_ = options;
+    if (options.boundary_interval < 0 ||
+        options.boundary_path.empty() != (options.boundary_interval == 0) ||
+        (options.boundary_compress && options.boundary_path.empty()) ||
+        (!options.boundary_path.empty() && options.bench_steps > 0) ||
+        (options.boundary_projection != boundary::Projection::Basal &&
+         options.boundary_projection != boundary::Projection::Maximum) ||
+        (options.boundary_projection == boundary::Projection::Basal &&
+         !params.substrate_slab())) {
+        std::fprintf(stderr, "[3d] invalid boundary output configuration\n");
+        return false;
+    }
     const bool measure_shards_requested =
         options.measure_shards_supplied || options.measure_shards != 0;
     if (measure_shards_requested &&
@@ -246,11 +236,9 @@ bool Sim3D::allocate(const SimParams3D& params,
     const PromotedMeasureReduction3D reduction{
         options_.promoted_measure_shards,
         options_.promoted_measure_auto_wave_ctas};
-    const bool reduction_valid = options_.promoted_measure_shards < 0
-        ? (options_.promoted_measure_auto_wave_ctas == 0 ||
-           valid_checkpoint_promoted_measure_reduction(reduction))
-        : (valid_promoted_measure_policy(options_.promoted_measure_shards) &&
-           options_.promoted_measure_auto_wave_ctas == 0);
+    const bool reduction_valid =
+        valid_fresh_promoted_measure_reduction(reduction) ||
+        valid_checkpoint_promoted_measure_reduction(reduction);
     if (!reduction_valid) {
         std::fprintf(stderr,
             "[3d] invalid promoted-measurement reduction policy\n");
@@ -273,8 +261,9 @@ bool Sim3D::allocate(const SimParams3D& params,
             B_, minimum_edge, kBrickAlignment, params.minimum_domain_edge());
         return false;
     }
-    if (!checked_cube_size(static_cast<std::size_t>(B_), &brick_words_)) {
-        std::fprintf(stderr, "[3d] B^3 overflows host size_t\n");
+    field_storage_.z_cap = params.bounded_z() ? params.Nz : 0;
+    if (!field_storage_.checked_words(B_, &brick_words_)) {
+        std::fprintf(stderr, "[3d] cell field allocation overflows host size_t\n");
         return false;
     }
     if (params.Nx > std::numeric_limits<int>::max() - 31) {
@@ -302,26 +291,7 @@ bool Sim3D::allocate(const SimParams3D& params,
     maximum_support_edge_ =
         ((params.minimum_domain_edge() - 1) / kBrickAlignment) *
         kBrickAlignment;
-    // Start with a modest on-demand tier; later exhaustion grows the common
-    // enlarged-cell tier up to the largest cube that fits inside the domain.
-    const std::int64_t first_growth = B_ >= 128
-        ? std::max<std::int64_t>(224, static_cast<std::int64_t>(B_) + 64)
-        : static_cast<std::int64_t>(B_) + 64;
-    const int desired_support_edge =
-        first_growth >= maximum_support_edge_
-            ? maximum_support_edge_
-            : round_up_to_multiple(static_cast<int>(first_growth),
-                                   kBrickAlignment);
-    promoted_edge_ = maximum_support_edge_ > B_
-        ? desired_support_edge : 0;
-    promoted_words_ = 0;
-    if (promoted_edge_ > 0 &&
-        (!valid_runtime_geometry(promoted_edge_, layout_) ||
-         !checked_cube_size(static_cast<std::size_t>(promoted_edge_),
-                            &promoted_words_))) {
-        std::fprintf(stderr, "[3d] adaptive support edge is invalid\n");
-        return false;
-    }
+    promoted_edge_ = 0;
 
     if (!gpu_ok(cudaSetDevice(options.device), "cudaSetDevice")) return false;
     cudaDeviceProp property{};
@@ -411,17 +381,6 @@ bool Sim3D::allocate(const SimParams3D& params,
         measurement_shards_ = resolved_measure;
     }
     fast_base_blocks_per_sm_ = fast_update_sharded;
-    // The fast path has no persistent partial-sum layout, so it can use any
-    // otherwise idle capacity in one population-wide occupancy wave.
-    throughput_update_shards_ = occupancy_wave_shards(
-        params.num_cells, property.multiProcessorCount, fast_update_sharded,
-        kMaximumPromotedShards);
-    if (options.fast_base_shards > 0) {
-        // Benchmark override for the fast update. The deterministic
-        // measurement path keeps its own count and partial-sum layout.
-        throughput_update_shards_ = std::max(
-            1, std::min(options.fast_base_shards, kMaximumPromotedShards));
-    }
     sm_count_ = property.multiProcessorCount;
     if (!gpu_ok(detail::promoted_fast_update_occupancy(
                     &fast_promoted_blocks_per_sm_, layout_),
@@ -470,8 +429,11 @@ bool Sim3D::allocate(const SimParams3D& params,
     if (params.resolved_wall_channel() &&
         !multiply_bytes(wall_profile_bytes, 2, &channel_wall_storage_bytes))
         return false;
-    if (promoted_words_ > 0 &&
-        (!multiply_bytes(promoted_words_, sizeof(float),
+    std::size_t first_tier_words = 0;
+    const int first_tier_edge = next_brick_edge(B_, maximum_support_edge_);
+    if (first_tier_edge > 0 &&
+        (!field_storage_.checked_words(first_tier_edge, &first_tier_words) ||
+         !multiply_bytes(first_tier_words, sizeof(float),
                          &adaptive_reserve_bytes) ||
          !multiply_bytes(adaptive_reserve_bytes, 2,
                          &adaptive_reserve_bytes)))
@@ -605,6 +567,9 @@ bool Sim3D::allocate(const SimParams3D& params,
     std::printf("  domain %d x %d x %d (pitch %d), cell brick %d^3, N=%d\n",
                 params.Nx, params.Ny, params.Nz, layout_.pitch_x, B_,
                 params.num_cells);
+    if (field_storage_.compact(B_))
+        std::printf("  stored cell field %d x %d x %d; exterior z planes are implicit zero\n",
+                    B_, B_, field_storage_.planes(B_));
     std::printf("  mode %s: phi x%d (%.2f GiB each), S x%d (%.2f GiB each), "
                 "scratch slots %d, allocation %.2f GiB (limit %.2f GiB)\n",
                 storage_mode_name(selected_mode_), phi_buffers_,
@@ -614,15 +579,17 @@ bool Sim3D::allocate(const SimParams3D& params,
                 static_cast<double>(required_device_bytes_) / 1073741824.0,
                 static_cast<double>(allocation_limit) / 1073741824.0);
     std::printf("  measurement CTAs/cell %d; fast throughput-update CTAs/cell %d\n",
-                measurement_shards_, throughput_update_shards_);
-    std::printf("  promoted fast-update occupancy %d CTA/SM (shard cap %d)\n",
-                fast_promoted_blocks_per_sm_, kMaximumPromotedShards);
+                measurement_shards_, fast_base_update_shards(UpdateTilePass3D::All));
+    std::printf("  promoted fast-update occupancy %d CTA/SM "
+                "(auto cap %d; override cap %d)\n",
+                fast_promoted_blocks_per_sm_, kAutomaticUpdateShardCap,
+                kMaximumFastUpdateShards);
     if (adaptive_headroom_reserved && adaptive_reserve_bytes > 0)
         std::printf("  auto mode retains %.3f GiB for one first-tier "
                     "adaptive cell\n",
                     static_cast<double>(adaptive_reserve_bytes) /
                         1073741824.0);
-    else if (promoted_edge_ > B_ &&
+    else if (first_tier_edge > B_ &&
              adaptive_budget_remaining_ < adaptive_reserve_bytes)
         std::fprintf(stderr,
             "[3d] warning: selected storage leaves %.3f GiB adaptive "
@@ -798,6 +765,12 @@ bool Sim3D::allocate(const SimParams3D& params,
 
 bool Sim3D::init_fresh(const SimParams3D& params,
                        const RunOptions3D& options) {
+    if (options.allow_promoted_measure_regroup) {
+        std::fprintf(stderr,
+            "[3d] --allow-promoted-measure-regroup requires --checkpoint "
+            "and explicit --promoted-measure-shards\n");
+        return false;
+    }
     if (params.hard_wall_channel() &&
         (!params.resolved_wall_channel() || !params.wall_repulsion_active())) {
         std::fprintf(stderr,
@@ -828,14 +801,21 @@ bool Sim3D::init_checkpoint(const CheckpointMeta3D& checkpoint,
         resolve_promoted_measure_resume(
             checkpoint.promoted_measure_reduction,
             options.promoted_measure_shards_supplied,
-            options.promoted_measure_shards, &reduction);
+            options.promoted_measure_shards, &reduction,
+            options.allow_promoted_measure_regroup);
     if (reduction_result != ReductionResumeResult::Ok) {
-        std::fprintf(stderr,
-            reduction_result == ReductionResumeResult::Mismatch
-                ? "[3d] checkpoint reduction policy does not match the "
-                  "requested promoted-measurement policy\n"
-                : "[3d] checkpoint has an invalid promoted-measurement "
-                  "reduction contract\n");
+        if (reduction_result == ReductionResumeResult::InvalidRequest) {
+            std::fprintf(stderr,
+                "[3d] promoted measurement regrouping requires an explicit "
+                "--promoted-measure-shards policy in -1..64\n");
+        } else {
+            std::fprintf(stderr,
+                reduction_result == ReductionResumeResult::Mismatch
+                    ? "[3d] checkpoint reduction policy does not match the "
+                      "requested promoted-measurement policy\n"
+                    : "[3d] checkpoint has an invalid promoted-measurement "
+                      "reduction contract\n");
+        }
         return false;
     }
     RunOptions3D continued_options = options;
@@ -875,17 +855,18 @@ bool Sim3D::init_checkpoint(const CheckpointMeta3D& checkpoint,
     load.d_phi = d_phi_[0];
     load.h_promoted_phi = h_promoted_phi_[0].data();
     load.stream = stream_;
+    load.storage = field_storage_;
     if (!checkpoint_load_3d(path, checkpoint, load))
         return false;
-    if (!h_promoted_ids_.empty()) {
-        const std::size_t promoted_bytes = promoted_words_ * sizeof(float);
-        for (int id : h_promoted_ids_)
-            if (!gpu_ok(cudaMemcpyAsync(
-                            h_promoted_phi_[1][static_cast<std::size_t>(id)],
-                            h_promoted_phi_[0][static_cast<std::size_t>(id)],
-                            promoted_bytes, cudaMemcpyDeviceToDevice, stream_),
-                        "initialize alternate promoted checkpoint buffer"))
-                return false;
+    for (int id : h_promoted_ids_) {
+        std::size_t words = 0, bytes = 0;
+        if (!field_storage_.checked_words(checkpoint.storage_edges[id], &words) ||
+            !multiply_bytes(words, sizeof(float), &bytes) ||
+            !gpu_ok(cudaMemcpyAsync(h_promoted_phi_[1][id],
+                                    h_promoted_phi_[0][id], bytes,
+                                    cudaMemcpyDeviceToDevice, stream_),
+                    "initialize alternate adaptive checkpoint buffer"))
+            return false;
     }
     current_phi_index_ = 0;
     current_S_index_ = 0;
@@ -896,7 +877,22 @@ bool Sim3D::init_checkpoint(const CheckpointMeta3D& checkpoint,
         !refresh_measurements(false, true) ||
         !synchronize_and_check("checkpoint restore"))
         return false;
-    return initialize_common();
+    if (!initialize_common()) return false;
+    if (reduction.policy != checkpoint.promoted_measure_reduction.policy) {
+        std::fprintf(stderr,
+            "[3d] promoted measurement regrouping enabled: policy %d -> %d; "
+            "floating-point reduction grouping changes\n",
+            checkpoint.promoted_measure_reduction.policy, reduction.policy);
+    }
+    const int promoted_count = active_promoted_count();
+    std::printf(
+        "[3d] resumed promoted measurement: promoted_cells=%d policy=%d "
+        "auto_wave_ctas=%d resolved_shards=%d; future checkpoints/trajectory "
+        "headers use this grouping (base_shards=%d)\n",
+        promoted_count, options_.promoted_measure_shards,
+        options_.promoted_measure_auto_wave_ctas,
+        promoted_measure_shard_count(promoted_count), measurement_shards_);
+    return true;
 }
 
 bool Sim3D::initialize_fields() {
@@ -1171,6 +1167,7 @@ bool Sim3D::initialize_fields() {
     init.layout = layout_;
     init.lambda = static_cast<float>(params_.lambda);
     init.seed_radius = static_cast<float>(seed_radius);
+    init.storage = field_storage_;
     launch_initialize_spheres(init, stream_);
     if (!gpu_ok(cudaGetLastError(), "initialize-spheres launch")) return false;
     current_phi_index_ = 0;
@@ -1197,11 +1194,48 @@ bool Sim3D::initialize_common() {
             "[3d] resolved trajectory interval exceeds the checkpoint limit\n");
         return false;
     }
+    if (!options_.boundary_path.empty()) {
+        const auto path = std::filesystem::absolute(options_.boundary_path).lexically_normal();
+        if (!options_.trajectory_path.empty() &&
+            path == std::filesystem::absolute(options_.trajectory_path).lexically_normal()) {
+            std::fprintf(stderr, "[3d] boundary output and trajectory paths must differ\n");
+            return false;
+        }
+        if (!options_.checkpoint_dir.empty() &&
+            path.parent_path() == std::filesystem::absolute(options_.checkpoint_dir).lexically_normal()) {
+            const std::string name = path.filename().string();
+            if (name == "checkpoint.pf3d" ||
+                (name.rfind("checkpoint_", 0) == 0 && path.extension() == ".pf3d")) {
+                std::fprintf(stderr, "[3d] boundary output must not use a checkpoint filename\n");
+                return false;
+            }
+        }
+    }
     if (!options_.trajectory_path.empty() && !open_trajectory()) return false;
     // Seed a newly created trajectory at the initialized state. An existing
     // compatible trajectory keeps its absolute sampling grid across resumes.
     if (trajectory_file_ && trajectory_frames_ == 0 && !append_trajectory())
         return false;
+    if (!options_.boundary_path.empty()) {
+        boundary_output_ = std::make_unique<BoundaryOutput3D>();
+        if (!boundary_output_->open(options_.boundary_path, params_,
+                options_.boundary_projection,
+                static_cast<std::uint64_t>(options_.boundary_interval),
+                options_.boundary_compress) || !append_boundary()) return false;
+    }
+    return true;
+}
+
+bool Sim3D::append_boundary() {
+    if (!boundary_output_) return true;
+    // A distributed step leaves remote-owned fields on the peer. Materialize
+    // them for this observer without refreshing moments or consuming a tumble.
+    if (gather_state_ &&
+        (!gather_state_() || !synchronize_and_check("boundary field gather"))) return false;
+    if (!boundary_output_->capture(current_phi(),
+            d_promoted_phi_[current_promoted_phi_index_], d_cells_, B_, stream_,
+            steps_done_, time(), field_storage_)) return false;
+    last_boundary_step_ = steps_done_;
     return true;
 }
 
@@ -1242,430 +1276,6 @@ bool Sim3D::upload_promoted_tables() {
     return true;
 }
 
-bool Sim3D::allocate_promoted_fields(
-    const std::vector<int>& cell_ids, std::vector<CellState3D>* states) {
-    if (cell_ids.empty()) return true;
-    if (!states || states->size() != static_cast<std::size_t>(params_.num_cells) ||
-        promoted_edge_ <= B_ || promoted_words_ == 0) {
-        std::fprintf(stderr,
-            "[3d] support exhausted but no larger aligned brick fits inside "
-            "the domain (base B=%d, minimum extent %d)\n", B_,
-            params_.minimum_domain_edge());
-        return false;
-    }
-    std::size_t one_field_bytes = 0, bytes_per_cell = 0, requested_bytes = 0;
-    if (!multiply_bytes(promoted_words_, sizeof(float), &one_field_bytes) ||
-        !multiply_bytes(one_field_bytes, 2, &bytes_per_cell) ||
-        !multiply_bytes(bytes_per_cell, cell_ids.size(), &requested_bytes) ||
-        requested_bytes > adaptive_budget_remaining_) {
-        std::fprintf(stderr,
-            "[3d] adaptive support needs %.3f GiB but only %.3f GiB remains "
-            "inside the configured HBM budget; the accepted state is retained\n",
-            static_cast<double>(requested_bytes) / 1073741824.0,
-            static_cast<double>(adaptive_budget_remaining_) / 1073741824.0);
-        return false;
-    }
-
-    struct PendingAllocation { int id; float* field[2]; };
-    std::vector<PendingAllocation> pending;
-    pending.reserve(cell_ids.size());
-    auto release_pending = [&]() {
-        for (PendingAllocation& allocation : pending)
-            for (float*& field : allocation.field)
-                if (field) { cudaFree(field); field = nullptr; }
-    };
-
-    const std::size_t base_words = brick_words_;
-    const int offset = (promoted_edge_ - B_) / 2;
-    for (int id : cell_ids) {
-        if (id < 0 || id >= params_.num_cells ||
-            h_promoted_phi_[0][static_cast<std::size_t>(id)] != nullptr ||
-            cell_is_promoted((*states)[static_cast<std::size_t>(id)], B_)) {
-            std::fprintf(stderr, "[3d] invalid duplicate promotion request\n");
-            release_pending();
-            return false;
-        }
-        PendingAllocation allocation{id, {nullptr, nullptr}};
-        if (!gpu_ok(cudaMalloc(reinterpret_cast<void**>(&allocation.field[0]),
-                               one_field_bytes),
-                    "cudaMalloc(adaptive phi 0)")) {
-            release_pending();
-            return false;
-        }
-        if (!gpu_ok(cudaMalloc(reinterpret_cast<void**>(&allocation.field[1]),
-                               one_field_bytes),
-                    "cudaMalloc(adaptive phi 1)")) {
-            cudaFree(allocation.field[0]);
-            release_pending();
-            return false;
-        }
-        pending.push_back(allocation);
-    }
-
-    for (PendingAllocation& allocation : pending) {
-        for (float* field : allocation.field)
-            if (!gpu_ok(cudaMemsetAsync(field, 0, one_field_bytes, stream_),
-                        "clear adaptive phi")) {
-                cudaStreamSynchronize(stream_);
-                release_pending();
-                return false;
-            }
-        const float* source = current_phi()
-            + static_cast<std::size_t>(allocation.id) * base_words;
-        for (float* field : allocation.field) {
-            if (!copy_centered_cube(field, promoted_edge_, source, B_,
-                                    stream_)) {
-                cudaStreamSynchronize(stream_);
-                release_pending();
-                return false;
-            }
-        }
-    }
-    if (!gpu_ok(cudaStreamSynchronize(stream_),
-                "adaptive support migration")) {
-        release_pending();
-        return false;
-    }
-
-    const std::uint32_t recovered =
-        flag3d_bit(FLAG3D_SUPPORT_EXHAUSTED) |
-        flag3d_bit(FLAG3D_SUPPORT_EDGE);
-    for (PendingAllocation& allocation : pending) {
-        const std::size_t id = static_cast<std::size_t>(allocation.id);
-        CellState3D& state = (*states)[id];
-        state.origin_x -= offset;
-        state.origin_y -= offset;
-        state.origin_z -= offset;
-        state.Cx += static_cast<double>(offset) * state.V;
-        state.Cy += static_cast<double>(offset) * state.V;
-        state.Cz += static_cast<double>(offset) * state.V;
-        if (state.bb_hi_x >= state.bb_lo_x) {
-            state.bb_lo_x += offset; state.bb_hi_x += offset;
-            state.bb_lo_y += offset; state.bb_hi_y += offset;
-            state.bb_lo_z += offset; state.bb_hi_z += offset;
-        }
-        state.pending_shift_x = state.pending_shift_y =
-            state.pending_shift_z = 0;
-        state.storage_edge = static_cast<std::uint32_t>(promoted_edge_);
-        state.flags &= ~recovered;
-        h_promoted_phi_[0][id] = allocation.field[0];
-        h_promoted_phi_[1][id] = allocation.field[1];
-        h_promoted_ids_.push_back(allocation.id);
-        allocation.field[0] = allocation.field[1] = nullptr;
-    }
-    if (!upload_promoted_tables() ||
-        !gpu_ok(cudaMemcpyAsync(d_cells_, states->data(),
-                                states->size() * sizeof(CellState3D),
-                                cudaMemcpyHostToDevice, stream_),
-                "install promoted cell states") ||
-        !gpu_ok(cudaMemsetAsync(d_flags_ + FLAG3D_SUPPORT_EXHAUSTED, 0,
-                                sizeof(std::uint32_t), stream_),
-                "clear recovered support flag") ||
-        !gpu_ok(cudaMemsetAsync(d_flags_ + FLAG3D_SUPPORT_EDGE, 0,
-                                sizeof(std::uint32_t), stream_),
-                "clear recovered support-edge advisory") ||
-        !gpu_ok(cudaMemsetAsync(
-                    d_support_requests_, 0,
-                    static_cast<std::size_t>(params_.num_cells) *
-                        sizeof(std::uint32_t), stream_),
-                "clear recovered support requests") ||
-        !gpu_ok(cudaStreamSynchronize(stream_),
-                "install adaptive support"))
-        return false;
-    adaptive_budget_remaining_ -= requested_bytes;
-    required_device_bytes_ += requested_bytes;
-    std::printf("[3d] promoted %zu cell(s) from B=%d to B=%d "
-                "(persistent adaptive storage %.3f GiB)\n",
-                cell_ids.size(), B_, promoted_edge_,
-                static_cast<double>(requested_bytes) / 1073741824.0);
-    return true;
-}
-
-bool Sim3D::grow_promoted_fields(
-    int new_edge, const std::vector<int>& additional_cell_ids,
-    std::vector<CellState3D>* states) {
-    const int old_edge = promoted_edge_;
-    if (!states ||
-        states->size() != static_cast<std::size_t>(params_.num_cells) ||
-        h_promoted_ids_.empty() || new_edge <= promoted_edge_ ||
-        new_edge > maximum_support_edge_ ||
-        !valid_runtime_geometry(new_edge, layout_)) {
-        std::fprintf(stderr,
-            "[3d] no larger aligned adaptive brick fits inside minimum "
-            "domain extent %d\n", params_.minimum_domain_edge());
-        return false;
-    }
-
-    std::vector<int> all_ids = h_promoted_ids_;
-    std::vector<unsigned char> seen(
-        static_cast<std::size_t>(params_.num_cells), 0u);
-    for (int id : all_ids) {
-        if (id < 0 || id >= params_.num_cells ||
-            seen[static_cast<std::size_t>(id)] != 0u) {
-            std::fprintf(stderr, "[3d] corrupt adaptive cell table\n");
-            return false;
-        }
-        seen[static_cast<std::size_t>(id)] = 1u;
-    }
-    for (int id : additional_cell_ids) {
-        if (id < 0 || id >= params_.num_cells ||
-            seen[static_cast<std::size_t>(id)] != 0u ||
-            cell_is_promoted((*states)[static_cast<std::size_t>(id)], B_)) {
-            std::fprintf(stderr, "[3d] invalid adaptive growth request\n");
-            return false;
-        }
-        seen[static_cast<std::size_t>(id)] = 1u;
-        all_ids.push_back(id);
-    }
-
-    std::size_t new_words = 0;
-    std::size_t new_field_bytes = 0, new_total_bytes = 0;
-    std::size_t old_field_bytes = 0, old_total_bytes = 0;
-    if (!checked_cube_size(static_cast<std::size_t>(new_edge), &new_words) ||
-        !multiply_bytes(new_words, sizeof(float), &new_field_bytes) ||
-        !multiply_bytes(new_field_bytes, 2 * all_ids.size(),
-                        &new_total_bytes) ||
-        !multiply_bytes(promoted_words_, sizeof(float), &old_field_bytes) ||
-        !multiply_bytes(old_field_bytes, 2 * h_promoted_ids_.size(),
-                        &old_total_bytes) ||
-        new_total_bytes > adaptive_budget_remaining_) {
-        std::fprintf(stderr,
-            "[3d] growing adaptive support to B=%d needs %.3f GiB of "
-            "transactional HBM but only %.3f GiB is free; the accepted "
-            "state is retained\n",
-            new_edge, static_cast<double>(new_total_bytes) / 1073741824.0,
-            static_cast<double>(adaptive_budget_remaining_) / 1073741824.0);
-        return false;
-    }
-
-    struct NewFields { int id; float* field[2]; };
-    std::vector<NewFields> pending;
-    pending.reserve(all_ids.size());
-    auto release_pending = [&]() {
-        for (NewFields& allocation : pending)
-            for (float*& field : allocation.field)
-                if (field) { cudaFree(field); field = nullptr; }
-    };
-    for (int id : all_ids) {
-        NewFields allocation{id, {nullptr, nullptr}};
-        if (!gpu_ok(cudaMalloc(reinterpret_cast<void**>(&allocation.field[0]),
-                               new_field_bytes),
-                    "cudaMalloc(grown adaptive phi 0)")) {
-            release_pending();
-            return false;
-        }
-        if (!gpu_ok(cudaMalloc(reinterpret_cast<void**>(&allocation.field[1]),
-                               new_field_bytes),
-                    "cudaMalloc(grown adaptive phi 1)")) {
-            cudaFree(allocation.field[0]);
-            release_pending();
-            return false;
-        }
-        pending.push_back(allocation);
-    }
-
-    std::vector<CellState3D> next_states = *states;
-    std::vector<float*> next_tables[2] = {
-        h_promoted_phi_[0], h_promoted_phi_[1]};
-    const std::size_t base_words = brick_words_;
-    for (NewFields& allocation : pending) {
-        const std::size_t id = static_cast<std::size_t>(allocation.id);
-        const bool was_promoted = h_promoted_phi_[0][id] != nullptr;
-        const int source_edge = was_promoted ? promoted_edge_ : B_;
-        const float* source = was_promoted
-            ? h_promoted_phi_[current_promoted_phi_index_][id]
-            : current_phi() + id * base_words;
-        for (float* field : allocation.field) {
-            if (!gpu_ok(cudaMemsetAsync(field, 0, new_field_bytes, stream_),
-                        "clear grown adaptive phi") ||
-                !copy_centered_cube(field, new_edge, source, source_edge,
-                                    stream_)) {
-                cudaStreamSynchronize(stream_);
-                release_pending();
-                return false;
-            }
-        }
-        const int offset = (new_edge - source_edge) / 2;
-        CellState3D& state = next_states[id];
-        state.origin_x -= offset;
-        state.origin_y -= offset;
-        state.origin_z -= offset;
-        state.Cx += static_cast<double>(offset) * state.V;
-        state.Cy += static_cast<double>(offset) * state.V;
-        state.Cz += static_cast<double>(offset) * state.V;
-        if (state.bb_hi_x >= state.bb_lo_x) {
-            state.bb_lo_x += offset; state.bb_hi_x += offset;
-            state.bb_lo_y += offset; state.bb_hi_y += offset;
-            state.bb_lo_z += offset; state.bb_hi_z += offset;
-        }
-        state.pending_shift_x = state.pending_shift_y =
-            state.pending_shift_z = 0;
-        state.storage_edge = static_cast<std::uint32_t>(new_edge);
-        state.flags &= ~(flag3d_bit(FLAG3D_SUPPORT_EXHAUSTED) |
-                         flag3d_bit(FLAG3D_SUPPORT_EDGE));
-        next_tables[0][id] = allocation.field[0];
-        next_tables[1][id] = allocation.field[1];
-    }
-    if (!gpu_ok(cudaStreamSynchronize(stream_),
-                "grow adaptive support fields")) {
-        release_pending();
-        return false;
-    }
-
-    const std::size_t pointer_bytes =
-        static_cast<std::size_t>(params_.num_cells) * sizeof(float*);
-    const std::size_t state_bytes =
-        next_states.size() * sizeof(CellState3D);
-    bool installed = true;
-    for (int buffer = 0; buffer < 2; ++buffer)
-        installed = installed && gpu_ok(cudaMemcpyAsync(
-            d_promoted_phi_[buffer], next_tables[buffer].data(), pointer_bytes,
-            cudaMemcpyHostToDevice, stream_),
-            "install grown adaptive pointer table");
-    installed = installed && gpu_ok(cudaMemcpyAsync(
-        d_promoted_ids_, all_ids.data(), all_ids.size() * sizeof(int),
-        cudaMemcpyHostToDevice, stream_), "install grown adaptive ids");
-    installed = installed && gpu_ok(cudaMemcpyAsync(
-        d_cells_, next_states.data(), state_bytes, cudaMemcpyHostToDevice,
-        stream_), "install grown adaptive cell states");
-    installed = installed && gpu_ok(cudaMemsetAsync(
-        d_flags_ + FLAG3D_SUPPORT_EXHAUSTED, 0, sizeof(std::uint32_t), stream_),
-        "clear recovered support flag");
-    installed = installed && gpu_ok(cudaMemsetAsync(
-        d_flags_ + FLAG3D_SUPPORT_EDGE, 0, sizeof(std::uint32_t), stream_),
-        "clear recovered support-edge advisory");
-    installed = installed && gpu_ok(cudaMemsetAsync(
-        d_support_requests_, 0,
-        static_cast<std::size_t>(params_.num_cells) * sizeof(std::uint32_t),
-        stream_), "clear recovered support requests");
-    installed = installed && gpu_ok(cudaStreamSynchronize(stream_),
-                                    "install grown adaptive support");
-    if (!installed) {
-        // Restore the live pointer tables before releasing tentative storage.
-        cudaStreamSynchronize(stream_);
-        for (int buffer = 0; buffer < 2; ++buffer)
-            cudaMemcpy(d_promoted_phi_[buffer], h_promoted_phi_[buffer].data(),
-                       pointer_bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_promoted_ids_, h_promoted_ids_.data(),
-                   h_promoted_ids_.size() * sizeof(int),
-                   cudaMemcpyHostToDevice);
-        cudaMemcpy(d_cells_, states->data(), state_bytes,
-                   cudaMemcpyHostToDevice);
-        release_pending();
-        return false;
-    }
-
-    for (int id : h_promoted_ids_)
-        for (int buffer = 0; buffer < 2; ++buffer)
-            cudaFree(h_promoted_phi_[buffer][static_cast<std::size_t>(id)]);
-    h_promoted_phi_[0].swap(next_tables[0]);
-    h_promoted_phi_[1].swap(next_tables[1]);
-    h_promoted_ids_.swap(all_ids);
-    for (NewFields& allocation : pending)
-        allocation.field[0] = allocation.field[1] = nullptr;
-    *states = std::move(next_states);
-    promoted_edge_ = new_edge;
-    promoted_words_ = new_words;
-    adaptive_budget_remaining_ =
-        adaptive_budget_remaining_ - new_total_bytes + old_total_bytes;
-    required_device_bytes_ =
-        required_device_bytes_ + new_total_bytes - old_total_bytes;
-    std::printf("[3d] grew adaptive support for %zu cell(s) from B=%d to "
-                "B=%d (persistent storage %.3f GiB)\n",
-                h_promoted_ids_.size(), old_edge, new_edge,
-                static_cast<double>(new_total_bytes) / 1073741824.0);
-    return true;
-}
-
-bool Sim3D::install_checkpoint_promotions(
-    const CheckpointMeta3D& checkpoint) {
-    const int N = params_.num_cells;
-    if (checkpoint.storage_edges.size() != static_cast<std::size_t>(N)) {
-        std::fprintf(stderr,
-            "[3d] checkpoint support-edge table has the wrong length\n");
-        return false;
-    }
-    std::vector<int> ids;
-    int stored_promoted_edge = 0;
-    for (int n = 0; n < N; ++n) {
-        const int edge = checkpoint.storage_edges[static_cast<std::size_t>(n)];
-        if (edge == B_) continue;
-        if (edge <= B_ || edge >= params_.minimum_domain_edge() ||
-            edge % kBrickAlignment != 0 ||
-            (stored_promoted_edge != 0 && stored_promoted_edge != edge)) {
-            std::fprintf(stderr,
-                "[3d] checkpoint contains an unsupported adaptive edge %d\n",
-                edge);
-            return false;
-        }
-        stored_promoted_edge = edge;
-        ids.push_back(n);
-    }
-    if (ids.empty()) return upload_promoted_tables();
-
-    promoted_edge_ = stored_promoted_edge;
-    if (!checked_cube_size(static_cast<std::size_t>(promoted_edge_),
-                           &promoted_words_))
-        return false;
-    std::size_t one_field_bytes = 0, requested_bytes = 0;
-    if (!multiply_bytes(promoted_words_, sizeof(float), &one_field_bytes) ||
-        !multiply_bytes(one_field_bytes, 2 * ids.size(), &requested_bytes) ||
-        requested_bytes > adaptive_budget_remaining_) {
-        std::fprintf(stderr,
-            "[3d] checkpoint adaptive storage needs %.3f GiB but the "
-            "configured HBM budget has %.3f GiB available\n",
-            static_cast<double>(requested_bytes) / 1073741824.0,
-            static_cast<double>(adaptive_budget_remaining_) / 1073741824.0);
-        return false;
-    }
-
-    std::vector<std::pair<float*, float*>> allocations;
-    allocations.reserve(ids.size());
-    auto release = [&]() {
-        for (auto allocation : allocations) {
-            if (allocation.first) cudaFree(allocation.first);
-            if (allocation.second) cudaFree(allocation.second);
-        }
-    };
-    for (std::size_t slot = 0; slot < ids.size(); ++slot) {
-        float* first = nullptr;
-        float* second = nullptr;
-        if (!gpu_ok(cudaMalloc(reinterpret_cast<void**>(&first),
-                               one_field_bytes),
-                    "cudaMalloc(checkpoint adaptive phi 0)")) {
-            release();
-            return false;
-        }
-        if (!gpu_ok(cudaMalloc(reinterpret_cast<void**>(&second),
-                               one_field_bytes),
-                    "cudaMalloc(checkpoint adaptive phi 1)")) {
-            cudaFree(first);
-            release();
-            return false;
-        }
-        allocations.emplace_back(first, second);
-    }
-    // Publish only after the complete allocation succeeds. A mid-allocation
-    // OOM therefore leaves no dangling host entries for the destructor.
-    for (std::size_t slot = 0; slot < ids.size(); ++slot) {
-        const std::size_t id = static_cast<std::size_t>(ids[slot]);
-        h_promoted_phi_[0][id] = allocations[slot].first;
-        h_promoted_phi_[1][id] = allocations[slot].second;
-        h_promoted_ids_.push_back(ids[slot]);
-    }
-    if (!upload_promoted_tables()) {
-        for (int id : ids) {
-            h_promoted_phi_[0][static_cast<std::size_t>(id)] = nullptr;
-            h_promoted_phi_[1][static_cast<std::size_t>(id)] = nullptr;
-        }
-        h_promoted_ids_.clear();
-        release();
-        return false;
-    }
-    adaptive_budget_remaining_ -= requested_bytes;
-    required_device_bytes_ += requested_bytes;
-    return true;
-}
 
 bool Sim3D::reconstruct_current_S() {
     launch_clear_S(current_S(), layout_, stream_);
@@ -1677,11 +1287,13 @@ bool Sim3D::reconstruct_current_S() {
     scatter.layout = layout_;
     scatter.N = params_.num_cells;
     scatter.B = B_;
+    scatter.selection = selection_;
+    scatter.storage = field_storage_;
     launch_scatter_current(scatter, stream_);
-    if (!h_promoted_ids_.empty())
+    if (active_promoted_count() > 0)
         launch_scatter_promoted(
             scatter, d_promoted_phi_[current_promoted_phi_index_],
-            d_promoted_ids_, static_cast<int>(h_promoted_ids_.size()),
+            active_promoted_ids(), active_promoted_count(),
             promoted_edge_, stream_);
     return gpu_ok(cudaGetLastError(), "reconstruct S launch");
 }
@@ -1699,6 +1311,7 @@ bool Sim3D::refresh_measurements(bool apply_tumble,
     measure.layout = layout_;
     measure.N = params_.num_cells;
     measure.B = B_;
+    measure.selection = selection_;
     measure.partials = d_moment_partials_;
     measure.shards = measurement_shards_;
     measure.polarity_stream = params_.polarity_stream();
@@ -1709,20 +1322,24 @@ bool Sim3D::refresh_measurements(bool apply_tumble,
     measure.support_margin = static_cast<int>(kBrickSafetyMargin);
     measure.apply_tumble = apply_tumble;
     measure.compute_surface = compute_surface;
+    measure.storage = field_storage_;
     if (!launch_measure_cells_only(measure, stream_)) {
         std::fprintf(stderr, "[3d] invalid base measurement launch contract\n");
         return false;
     }
     if (!phase_mark(1)) return false;
-    if (!h_promoted_ids_.empty()) {
-        const int promoted_count = static_cast<int>(h_promoted_ids_.size());
-        const int measure_shards = promoted_measure_shard_count(promoted_count);
+    if (active_promoted_count() > 0) {
+        const int promoted_count = active_promoted_count();
+        // The reduction grouping is a numerical contract for the full cohort,
+        // independent of how its cells are distributed between devices.
+        const int measure_shards = promoted_measure_shard_count(
+            static_cast<int>(h_promoted_ids_.size()));
         if (measure_shards > 1) {
             MeasureArgs3D sharded = measure;
             sharded.shards = measure_shards;
             if (!detail::launch_measure_promoted_shards(
                     sharded, d_promoted_phi_[current_promoted_phi_index_],
-                    d_promoted_ids_, promoted_count, promoted_edge_,
+                    active_promoted_ids(), promoted_count, promoted_edge_,
                     d_promoted_partials_, stream_)) {
                 std::fprintf(stderr,
                     "[3d] invalid promoted measurement launch contract\n");
@@ -1731,7 +1348,7 @@ bool Sim3D::refresh_measurements(bool apply_tumble,
         } else {
             if (!launch_measure_promoted(
                     measure, d_promoted_phi_[current_promoted_phi_index_],
-                    d_promoted_ids_, promoted_count, promoted_edge_, stream_)) {
+                    active_promoted_ids(), promoted_count, promoted_edge_, stream_)) {
                 std::fprintf(stderr,
                     "[3d] invalid promoted measurement launch contract\n");
                 return false;
@@ -1751,6 +1368,10 @@ bool Sim3D::refresh_measurements(bool apply_tumble,
 }
 
 bool Sim3D::ensure_measurements(bool require_surface, const char* context) {
+    // Cached moments do not imply that this rank holds every current field.
+    // Materialize before output/verification, and check any reconstruction flags.
+    if (gather_state_ &&
+        (!gather_state_() || !synchronize_and_check(context))) return false;
     if (volume_current_ && (!require_surface || surface_current_)) return true;
     return refresh_measurements(false, require_surface) &&
            synchronize_and_check(context);
@@ -1759,12 +1380,11 @@ bool Sim3D::ensure_measurements(bool require_surface, const char* context) {
 int Sim3D::promoted_update_shards(int promoted_count) const {
     if (promoted_count <= 0) return 1;
     if (options_.promoted_shards > 0)
-        return std::min(options_.promoted_shards, kMaximumPromotedShards);
-    const std::int64_t wave = static_cast<std::int64_t>(sm_count_) *
-                              fast_promoted_blocks_per_sm_;
-    const std::int64_t fitting = wave / promoted_count;
-    return static_cast<int>(std::max<std::int64_t>(
-        1, std::min<std::int64_t>(kMaximumPromotedShards, fitting)));
+        return std::min(options_.promoted_shards, kMaximumFastUpdateShards);
+    const int tiles = capped_update_tile_count(
+        promoted_edge_, kBrickX, kBrickY, kBrickZ);
+    return queued_update_shards(promoted_count, sm_count_,
+                                fast_promoted_blocks_per_sm_, tiles);
 }
 
 int Sim3D::promoted_measure_shard_count(int promoted_count) const {
@@ -1779,12 +1399,21 @@ int Sim3D::promoted_measure_shard_count(int promoted_count) const {
         1, std::min<std::int64_t>(kMaximumPromotedShards, fitting)));
 }
 
-int Sim3D::fast_base_update_shards() const {
+int Sim3D::fast_base_update_shards(UpdateTilePass3D pass) const {
     if (options_.fast_base_shards > 0)
-        return std::min(options_.fast_base_shards, kMaximumPromotedShards);
-    const int live_base = params_.num_cells
-        - static_cast<int>(h_promoted_ids_.size());
+        return std::min(options_.fast_base_shards, kMaximumFastUpdateShards);
+    const int live_base = selection_.ids
+        ? selection_.count - active_promoted_count()
+        : params_.num_cells - static_cast<int>(h_promoted_ids_.size());
     if (live_base <= 0) return 1;
+    // Bounded walks skip external z tiles and have uneven work per shard.
+    // Queue several waves; this fast path contains no moment reductions.
+    if (params_.bounded_z() || pass != UpdateTilePass3D::All) {
+        const int tile_count = capped_update_tile_count(
+            B_, kBrickX, kBrickY, kBrickZ);
+        return queued_update_shards(live_base, sm_count_,
+                                    fast_base_blocks_per_sm_, tile_count);
+    }
     return occupancy_wave_shards(live_base, sm_count_,
                                  fast_base_blocks_per_sm_,
                                  kMaximumPromotedShards);
@@ -1813,6 +1442,32 @@ void Sim3D::clear_phase_events() noexcept {
 }
 
 bool Sim3D::launch_one_step() {
+    if (distributed_step_) return distributed_step_();
+    return begin_step() && finish_step();
+}
+
+const int* Sim3D::active_promoted_ids() const {
+    return owned_promoted_count_ < 0 ? d_promoted_ids_
+                                    : d_owned_promoted_ids_;
+}
+
+int Sim3D::active_promoted_count() const {
+    return owned_promoted_count_ < 0
+        ? static_cast<int>(h_promoted_ids_.size())
+        : owned_promoted_count_;
+}
+
+bool Sim3D::begin_step(const TileExchangeRegion3D* exchange_region) {
+    if (step_pending_) {
+        std::fprintf(stderr, "[3d] cannot begin a second unfinished step\n");
+        return false;
+    }
+    if (exchange_region &&
+        (!params_.bounded_z() || phi_buffers_ != 2 || S_buffers_ != 2 ||
+         !valid_tile_exchange_region(*exchange_region, layout_.ny, layout_.nz))) {
+        std::fprintf(stderr, "[3d] invalid boundary-first update contract\n");
+        return false;
+    }
     const bool full_moment = params_.full_moment_every > 0 &&
         steps_done_ % static_cast<std::uint64_t>(params_.full_moment_every) == 0;
     const bool measured_update = options_.strict && params_.verify_every > 0 &&
@@ -1835,6 +1490,7 @@ bool Sim3D::launch_one_step() {
     if (!phase_mark(3)) return false;
 
     UpdateArgs3D update{};
+    update.storage = field_storage_;
     update.phi_in = current_phi();
     update.phi_out = phi_buffers_ == 2 ? d_phi_[next_phi] : nullptr;
     update.S_in = current_S();
@@ -1846,6 +1502,7 @@ bool Sim3D::launch_one_step() {
     update.layout = layout_;
     update.N = params_.num_cells;
     update.B = B_;
+    update.selection = selection_;
     update.dt = static_cast<float>(params_.dt);
     update.V0 = params_.volume0();
     update.volume_scale = params_.volume();
@@ -1854,14 +1511,22 @@ bool Sim3D::launch_one_step() {
     // Surface does not enter the evolution equations. It is measured only at
     // its requested cadence or before output that requires it.
     update.compute_surface = false;
+    // Only the moment-free update may be reordered. Strict measured steps keep
+    // their pinned reduction grouping and perform the ordinary complete walk.
+    if (exchange_region && !measured_update) {
+        update.tile_pass = UpdateTilePass3D::Boundary;
+        update.exchange_region = *exchange_region;
+    }
     bool update_ok = true;
     if (phi_buffers_ == 2) {
         if (measured_update && measurement_shards_ > 1) {
             update_ok = launch_update_tiled_sharded(
                 update, d_moment_partials_, measurement_shards_, stream_);
-        } else if (!measured_update && fast_base_update_shards() > 1) {
+        } else if (!measured_update &&
+                   (update.tile_pass != UpdateTilePass3D::All ||
+                    fast_base_update_shards(update.tile_pass) > 1)) {
             update_ok = detail::launch_update_tiled_sharded_fast(
-                update, fast_base_update_shards(), stream_);
+                update, fast_base_update_shards(update.tile_pass), stream_);
         } else if (measured_update) {
             update_ok = launch_update_tiled(
                 update, update_grid_blocks_, stream_);
@@ -1890,20 +1555,21 @@ bool Sim3D::launch_one_step() {
         return false;
     }
     if (!phase_mark(4)) return false;
-    if (!h_promoted_ids_.empty()) {
-        const int promoted_count = static_cast<int>(h_promoted_ids_.size());
+    if (active_promoted_count() > 0) {
+        const int promoted_count = active_promoted_count();
         const int promoted_shards =
             measured_update ? 1 : promoted_update_shards(promoted_count);
         bool promoted_ok;
-        if (!measured_update && promoted_shards > 1) {
+        if (!measured_update &&
+            (update.tile_pass != UpdateTilePass3D::All || promoted_shards > 1)) {
             promoted_ok = detail::launch_update_promoted_sharded_fast(
                 update, d_promoted_phi_[current_promoted_phi_index_],
-                d_promoted_phi_[next_promoted_phi], d_promoted_ids_,
+                d_promoted_phi_[next_promoted_phi], active_promoted_ids(),
                 promoted_count, promoted_edge_, promoted_shards, stream_);
         } else {
             promoted_ok = launch_update_promoted(
                 update, d_promoted_phi_[current_promoted_phi_index_],
-                d_promoted_phi_[next_promoted_phi], d_promoted_ids_,
+                d_promoted_phi_[next_promoted_phi], active_promoted_ids(),
                 promoted_count, promoted_edge_, measured_update, stream_);
         }
         if (!promoted_ok) {
@@ -1913,12 +1579,50 @@ bool Sim3D::launch_one_step() {
         }
     }
     if (!phase_mark(5)) return false;
+    pending_update_ = update;
+    pending_measured_update_ = measured_update;
+    step_pending_ = true;
+    return gpu_ok(cudaGetLastError(), "3D update launch sequence");
+}
+
+bool Sim3D::enqueue_interior_update() {
+    if (!step_pending_ || pending_update_.tile_pass != UpdateTilePass3D::Boundary) {
+        std::fprintf(stderr, "[3d] interior update requires a pending boundary pass\n");
+        return false;
+    }
+    auto update = pending_update_;
+    update.tile_pass = UpdateTilePass3D::Interior;
+    if (!detail::launch_update_tiled_sharded_fast(
+            update, fast_base_update_shards(update.tile_pass), stream_)) return false;
+    const int promoted_count = active_promoted_count();
+    if (promoted_count > 0 &&
+        !detail::launch_update_promoted_sharded_fast(
+            update, d_promoted_phi_[current_promoted_phi_index_],
+            d_promoted_phi_[1 - current_promoted_phi_index_], active_promoted_ids(),
+            promoted_count, promoted_edge_, promoted_update_shards(promoted_count),
+            stream_)) return false;
+    // Both passes are now ordered in this stream; output may be accepted only
+    // after the coordinator joins incoming copies and merges integrity flags.
+    pending_update_.tile_pass = UpdateTilePass3D::All;
+    return gpu_ok(cudaGetLastError(), "3D interior update launch sequence");
+}
+
+bool Sim3D::finish_step() {
+    if (!step_pending_ || pending_update_.tile_pass != UpdateTilePass3D::All) {
+        std::fprintf(stderr, "[3d] cannot finish a step before its update\n");
+        return false;
+    }
+    const UpdateArgs3D& update = pending_update_;
+    const int next_S = S_buffers_ == 2 ? 1 - current_S_index_ : current_S_index_;
+    const int next_phi = phi_buffers_ == 2 ? 1 - current_phi_index_
+                                         : current_phi_index_;
+    const int next_promoted_phi = 1 - current_promoted_phi_index_;
     launch_repair_after_fatal(update, stream_);
-    if (!h_promoted_ids_.empty())
+    if (active_promoted_count() > 0)
         launch_repair_promoted_after_fatal(
             update, d_promoted_phi_[current_promoted_phi_index_],
-            d_promoted_phi_[next_promoted_phi], d_promoted_ids_,
-            static_cast<int>(h_promoted_ids_.size()), promoted_edge_, stream_);
+            d_promoted_phi_[next_promoted_phi], active_promoted_ids(),
+            active_promoted_count(), promoted_edge_, stream_);
     launch_finalize_origins(d_cells_, params_.num_cells, d_flags_, stream_);
     // Field/S repair precedes this complete state rollback. Because all work
     // is in one stream, a later queued step snapshots the restored state even
@@ -1936,12 +1640,13 @@ bool Sim3D::launch_one_step() {
         // All old-S reads and in-place writes have completed in stream order.
         if (!reconstruct_current_S()) return false;
     }
-    volume_current_ = measured_update;
+    volume_current_ = pending_measured_update_;
     surface_current_ = false;
     launch_advance_step(d_step_, d_flags_, stream_);
     if (!phase_mark(6)) return false;
     if (phase_active_ && phase_recorded_ < phase_capacity_) ++phase_recorded_;
     ++steps_done_;
+    step_pending_ = false;
     return gpu_ok(cudaGetLastError(), "3D step launch sequence");
 }
 
@@ -1969,44 +1674,37 @@ bool Sim3D::recover_support_exhaustion(
                            cudaMemcpyDeviceToHost),
                 "read adaptive support requests"))
         return false;
-    std::vector<int> base_requests;
-    bool promoted_exhausted = false;
+    std::vector<std::pair<int, int>> requested;
     for (int n = 0; n < params_.num_cells; ++n) {
         const CellState3D& state = states[static_cast<std::size_t>(n)];
-        const bool requested = requests[static_cast<std::size_t>(n)] != 0u ||
-            (state.flags & flag3d_bit(FLAG3D_SUPPORT_EXHAUSTED)) != 0u;
-        if (!requested) continue;
-        if (cell_is_promoted(state, B_)) promoted_exhausted = true;
-        else base_requests.push_back(n);
+        if (requests[n] == 0u &&
+            (state.flags & flag3d_bit(FLAG3D_SUPPORT_EXHAUSTED)) == 0u) continue;
+        const int edge = cell_support_edge(state, B_);
+        const int next = next_brick_edge(edge, maximum_support_edge_);
+        if (next == 0) {
+            std::fprintf(stderr, "[3d] cell %d support exhausted at B=%d; "
+                         "no larger cube fits the domain; accepted state retained\n",
+                         n, edge);
+            return false;
+        }
+        requested.emplace_back(n, next);
     }
-    if (!promoted_exhausted && base_requests.empty()) {
-        std::fprintf(stderr,
-            "[3d] global support-exhaustion counter has no owning cell\n");
+    if (requested.empty()) {
+        std::fprintf(stderr, "[3d] support-exhaustion counter has no owning cell\n");
         return false;
     }
 
-    bool migrated = false;
-    if (promoted_exhausted) {
-        if (promoted_edge_ >= maximum_support_edge_) {
-            std::fprintf(stderr,
-                "[3d] adaptive support B=%d reached the largest aligned "
-                "cube below the minimum domain extent %d; the accepted "
-                "state is retained\n",
-                promoted_edge_, params_.minimum_domain_edge());
-            return false;
-        }
-        const int increment = std::max(64, promoted_edge_ / 4);
-        const std::int64_t raw_candidate =
-            static_cast<std::int64_t>(promoted_edge_) + increment;
-        const int candidate = raw_candidate >= maximum_support_edge_
-            ? maximum_support_edge_
-            : round_up_to_multiple(static_cast<int>(raw_candidate),
-                                   kBrickAlignment);
-        const int next_edge = std::min(candidate, maximum_support_edge_);
-        migrated = grow_promoted_fields(next_edge, base_requests, &states);
-    } else {
-        migrated = allocate_promoted_fields(base_requests, &states);
-    }
+    const bool migrated = resize_cells(requested, &states);
+    if (migrated &&
+        (!gpu_ok(cudaMemsetAsync(d_flags_ + FLAG3D_SUPPORT_EXHAUSTED, 0,
+                                sizeof(std::uint32_t), stream_),
+                 "clear recovered support flag") ||
+         !gpu_ok(cudaMemsetAsync(d_flags_ + FLAG3D_SUPPORT_EDGE, 0,
+                                sizeof(std::uint32_t), stream_),
+                 "clear recovered support-edge advisory") ||
+         !gpu_ok(cudaMemsetAsync(d_support_requests_, 0,
+                                count * sizeof(std::uint32_t), stream_),
+                 "clear recovered support requests"))) return false;
     if (!migrated ||
         !reconstruct_current_S() ||
         !refresh_measurements(false, surface_current_, false) ||
@@ -2031,7 +1729,6 @@ bool Sim3D::recover_support_exhaustion(
         return false;
     }
     volume_current_ = true;
-    ++recovery_events_;
     return true;
 }
 
@@ -2067,6 +1764,16 @@ bool Sim3D::synchronize_and_check(const char* context) {
                            cudaMemcpyDeviceToHost), "read integrity flags"))
         return false;
     if (!any_fatal_flag(flags)) return true;
+    // Healthy polls need only agreed flags and the accepted step. Recovery,
+    // unlike polling, requires all retained fields and support requests.
+    if (gather_state_) {
+        if (!gather_state_() ||
+            !gpu_ok(cudaStreamSynchronize(stream_), context) ||
+            !gpu_ok(cudaMemcpy(flags.data(), d_flags_,
+                               flags.size() * sizeof(std::uint32_t),
+                               cudaMemcpyDeviceToHost),
+                    "read materialized integrity flags")) return false;
+    }
     if (recover_support_exhaustion(flags)) return true;
     (void)fatal_flags_present(true);
     return false;
@@ -2268,7 +1975,7 @@ bool Sim3D::append_trajectory() {
             current_phi(),
             d_promoted_phi_[current_promoted_phi_index_], d_cells_,
             params_.num_cells, B_, layout_, d_wall_psi_sq_,
-            params_.channel_height, params_.channel_padding, stream_);
+            params_.channel_height, params_.channel_padding, stream_, field_storage_);
         if (!gpu_ok(cudaGetLastError(), "channel wall-overlap measurement"))
             return false;
     }
@@ -2359,6 +2066,7 @@ bool Sim3D::checkpoint_at_current_state(const std::string& path) {
     view.h_promoted_phi =
         h_promoted_phi_[current_promoted_phi_index_].data();
     view.stream = stream_;
+    view.storage = field_storage_;
     return checkpoint_write_3d(path, view);
 }
 
@@ -2393,13 +2101,13 @@ bool Sim3D::verify(double* max_relative_volume_error,
                 "clear S verifier"))
         return false;
     launch_verify_cells(current_phi(), d_cells_, d_verify_cells_,
-                        params_.num_cells, B_, layout_, stream_);
+                        params_.num_cells, B_, layout_, stream_, field_storage_);
     if (!h_promoted_ids_.empty())
         launch_verify_promoted(
             d_promoted_phi_[current_promoted_phi_index_], d_cells_,
             d_verify_cells_, d_promoted_ids_,
             params_.num_cells, static_cast<int>(h_promoted_ids_.size()),
-            promoted_edge_, layout_, stream_);
+            promoted_edge_, layout_, stream_, field_storage_);
     launch_verify_S(current_S(), layout_, d_verify_S_, stream_);
     std::vector<VerifyCell3D> cells(
         static_cast<std::size_t>(params_.num_cells));
@@ -2463,6 +2171,10 @@ bool Sim3D::run() {
     const std::uint64_t verify_offset = verify_every > 0
         ? verify_every - steps_done_ % verify_every : 0;
     std::uint64_t next_verify = schedule_after(steps_done_, verify_offset);
+    std::uint64_t next_compaction = schedule_grid_after(steps_done_, kBrickCompactionEvery);
+    const std::uint64_t boundary_every = boundary_output_
+        ? static_cast<std::uint64_t>(options_.boundary_interval) : 0;
+    std::uint64_t next_boundary = schedule_grid_after(steps_done_, boundary_every);
     int since_poll = 0;
 
     while (steps_done_ < target && !terminate_requested) {
@@ -2473,6 +2185,8 @@ bool Sim3D::run() {
                            steps_done_ >= next_tagged ||
                            steps_done_ >= next_print ||
                            steps_done_ >= next_verify ||
+                           steps_done_ >= next_compaction ||
+                           steps_done_ >= next_boundary ||
                            steps_done_ >= target ||
                            since_poll >= kHostPollEvery;
         if (!event) continue;
@@ -2482,6 +2196,10 @@ bool Sim3D::run() {
                 "[3d] the failed in-memory step is diagnostic only; the last "
                 "completed rolling checkpoint was not replaced\n");
             return false;
+        }
+        if (steps_done_ >= next_compaction) {
+            if (!compact_promoted_fields()) return false;
+            next_compaction = schedule_grid_after(steps_done_, kBrickCompactionEvery);
         }
         if (steps_done_ >= next_verify) {
             double volume_error = 0.0;
@@ -2507,6 +2225,10 @@ bool Sim3D::run() {
         if (trajectory_file_ && steps_done_ >= next_trajectory) {
             if (!append_trajectory()) return false;
             advance_schedule(&next_trajectory, trajectory_every);
+        }
+        if (boundary_output_ && steps_done_ >= next_boundary) {
+            if (!append_boundary()) return false;
+            advance_schedule(&next_boundary, boundary_every);
         }
         if (!options_.checkpoint_dir.empty() && steps_done_ >= next_checkpoint) {
             const std::filesystem::path rolling =
@@ -2534,6 +2256,10 @@ bool Sim3D::run() {
         const std::filesystem::path rolling =
             std::filesystem::path(options_.checkpoint_dir) / "checkpoint.pf3d";
         if (!checkpoint_at_current_state(rolling.string())) return false;
+    }
+    if (boundary_output_) {
+        if (last_boundary_step_ != steps_done_ && !append_boundary()) return false;
+        if (!boundary_output_->close()) return false;
     }
     if (terminate_requested)
         std::printf("[3d] termination requested; stopped at accepted step %llu\n",

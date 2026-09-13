@@ -423,6 +423,80 @@ bool sync_stream(cudaStream_t stream) {
     return cuda_ok(cudaStreamSynchronize(stream), "stream synchronization");
 }
 
+bool storage_matches_geometry(CellFieldStorage3D storage,
+                              const SimParams3D& params) {
+    if (storage.z_cap == 0 ||
+        (params.bounded_z() && storage.z_cap == params.Nz)) return true;
+    std::fprintf(stderr,
+        "[ckpt3d] compact field storage must match the bounded domain height\n");
+    return false;
+}
+
+// The file remains cubic. Only this contiguous range has device storage when
+// a brick extends beyond the bounded z-domain; omitted planes serialize as zero.
+struct StoredPhaseSpan {
+    std::size_t logical_begin = 0;
+    std::size_t logical_end = 0;
+    std::size_t stored_begin = 0;
+};
+
+bool stored_phase_span(CellFieldStorage3D storage, int edge,
+                       std::int64_t origin_z, StoredPhaseSpan* span) {
+    CellFieldPlaneRange3D planes{};
+    if (!storage.retained_planes(edge, origin_z, &planes)) return false;
+    const std::size_t plane_words = static_cast<std::size_t>(edge) * edge;
+    span->logical_begin = static_cast<std::size_t>(planes.logical_begin) * plane_words;
+    span->logical_end = span->logical_begin +
+        static_cast<std::size_t>(planes.count) * plane_words;
+    span->stored_begin = static_cast<std::size_t>(planes.stored_begin) * plane_words;
+    return true;
+}
+
+void retained_chunk(const StoredPhaseSpan& span, std::size_t offset,
+                     std::size_t words, std::size_t* begin, std::size_t* end) {
+    const std::size_t limit = offset + words;
+    *begin = std::min(limit, std::max(offset, span.logical_begin));
+    *end = std::max(*begin, std::min(limit, span.logical_end));
+}
+
+bool unpack_phase_chunk(float* stage, const float* source,
+                         const StoredPhaseSpan& span, std::size_t offset,
+                         std::size_t words, cudaStream_t stream) {
+    std::size_t begin = 0, end = 0;
+    retained_chunk(span, offset, words, &begin, &end);
+    std::fill(stage, stage + (begin - offset), 0.0f);
+    std::fill(stage + (end - offset), stage + words, 0.0f);
+    return begin == end ||
+        (cuda_ok(cudaMemcpyAsync(stage + (begin - offset),
+                     source + span.stored_begin + (begin - span.logical_begin),
+                     (end - begin) * sizeof(float),
+                     cudaMemcpyDeviceToHost, stream), "phase payload D2H") &&
+         sync_stream(stream));
+}
+
+bool pack_phase_chunk(float* destination, const float* stage,
+                       const StoredPhaseSpan& span, std::size_t offset,
+                       std::size_t words, cudaStream_t stream) {
+    std::size_t begin = 0, end = 0;
+    retained_chunk(span, offset, words, &begin, &end);
+    const auto discarded_zero = [](const float* first, const float* last) {
+        return std::all_of(first, last,
+            [](float value) { return std::isfinite(value) && value == 0.0f; });
+    };
+    if (!discarded_zero(stage, stage + (begin - offset)) ||
+        !discarded_zero(stage + (end - offset), stage + words)) {
+        std::fprintf(stderr,
+            "[ckpt3d] nonzero or nonfinite field outside compact z storage\n");
+        return false;
+    }
+    return begin == end ||
+        (cuda_ok(cudaMemcpyAsync(
+                     destination + span.stored_begin + (begin - span.logical_begin),
+                     stage + (begin - offset), (end - begin) * sizeof(float),
+                     cudaMemcpyHostToDevice, stream), "phase payload H2D") &&
+         sync_stream(stream));
+}
+
 bool durable_close(std::FILE* file, const std::string& path) {
     if (std::fflush(file) != 0) {
         std::fprintf(stderr, "[ckpt3d] flush failed for %s: %s\n",
@@ -773,6 +847,7 @@ bool checkpoint_load_3d(const std::string& path,
             static_cast<std::size_t>(expected.params.num_cells)) {
         return false;
     }
+    if (!storage_matches_geometry(view.storage, expected.params)) return false;
     for (std::size_t index = 0; index < expected.storage_edges.size(); ++index) {
         const int edge = expected.storage_edges[index];
         if (edge > expected.brick_edge &&
@@ -806,8 +881,11 @@ bool checkpoint_load_3d(const std::string& path,
     const int N = expected.params.num_cells;
     const int B = expected.brick_edge;
     std::size_t base_voxels = 0;
+    std::size_t base_bytes = 0, total_base_bytes = 0;
     std::size_t maximum_voxels = 0;
-    if (!checked_cube_size(static_cast<std::size_t>(B), &base_voxels) ||
+    if (!view.storage.checked_words(B, &base_voxels) ||
+        !view.storage.checked_bytes(B, &base_bytes) ||
+        !checked_mul_size(static_cast<std::size_t>(N), base_bytes, &total_base_bytes) ||
         !checked_cube_size(static_cast<std::size_t>(
                                expected.max_storage_edge),
                            &maximum_voxels)) {
@@ -855,14 +933,24 @@ bool checkpoint_load_3d(const std::string& path,
             cell_stage[static_cast<std::size_t>(k)] = cell_from_record(
                 record, B);
             std::size_t cell_voxels = 0;
+            std::size_t stored_bytes = 0;
+            StoredPhaseSpan span{};
             if (!checked_cube_size(static_cast<std::size_t>(edge),
-                                   &cell_voxels)) {
+                                   &cell_voxels) ||
+                !view.storage.checked_bytes(edge, &stored_bytes) ||
+                !stored_phase_span(view.storage, edge, record.origin_z, &span)) {
                 std::fclose(file);
                 return false;
             }
             float* destination = edge == B
                 ? view.d_phi + static_cast<std::size_t>(index) * base_voxels
                 : view.h_promoted_phi[index];
+            if (view.storage.compact(edge) &&
+                !cuda_ok(cudaMemsetAsync(destination, 0, stored_bytes, view.stream),
+                         "clear compact phase storage")) {
+                std::fclose(file);
+                return false;
+            }
             for (std::size_t offset = 0; offset < cell_voxels;
                  offset += phase_stage_words) {
                 const std::size_t words =
@@ -874,12 +962,8 @@ bool checkpoint_load_3d(const std::string& path,
                 }
                 file_crc64 = ckpt3d::crc64_ecma_update(
                     file_crc64, phase_stage.data(), words * sizeof(float));
-                if (!cuda_ok(cudaMemcpyAsync(destination + offset,
-                                             phase_stage.data(),
-                                             words * sizeof(float),
-                                             cudaMemcpyHostToDevice, view.stream),
-                             "phase payload H2D") ||
-                    !sync_stream(view.stream)) {
+                if (!pack_phase_chunk(destination, phase_stage.data(), span,
+                                      offset, words, view.stream)) {
                     std::fclose(file);
                     return false;
                 }
@@ -930,6 +1014,7 @@ bool checkpoint_write_3d(const std::string& path,
         std::fprintf(stderr, "[ckpt3d] incomplete or unsupported write view\n");
         return false;
     }
+    if (!storage_matches_geometry(view.storage, *view.params)) return false;
     if (view.step > static_cast<std::uint64_t>(
                         std::numeric_limits<std::int64_t>::max()) ||
         !std::isfinite(view.time) || view.time < 0.0 || view.print_interval < 0) {
@@ -980,8 +1065,14 @@ bool checkpoint_write_3d(const std::string& path,
         return false;
     }
     std::size_t base_voxels = 0;
+    std::size_t base_stored_voxels = 0;
+    std::size_t base_bytes = 0, total_base_bytes = 0;
     if (!checked_cube_size(static_cast<std::size_t>(view.brick_edge),
-                           &base_voxels))
+                           &base_voxels) ||
+        !view.storage.checked_words(view.brick_edge, &base_stored_voxels) ||
+        !view.storage.checked_bytes(view.brick_edge, &base_bytes) ||
+        !checked_mul_size(static_cast<std::size_t>(view.params->num_cells),
+                          base_bytes, &total_base_bytes))
         return false;
 
     const int N = view.params->num_cells;
@@ -1024,8 +1115,10 @@ bool checkpoint_write_3d(const std::string& path,
             return false;
         }
         std::size_t cell_voxels = 0;
+        std::size_t stored_bytes = 0;
         if (!checked_cube_size(static_cast<std::size_t>(edge),
-                               &cell_voxels)) {
+                               &cell_voxels) ||
+            !view.storage.checked_bytes(edge, &stored_bytes)) {
             return false;
         }
         storage_edges[static_cast<std::size_t>(index)] = edge;
@@ -1095,21 +1188,19 @@ bool checkpoint_write_3d(const std::string& path,
                 file_crc64, &record, sizeof(record));
         }
         std::size_t cell_voxels = 0;
+        StoredPhaseSpan span{};
         ok = ok && checked_cube_size(static_cast<std::size_t>(edge),
-                                     &cell_voxels);
+                                     &cell_voxels) &&
+             stored_phase_span(view.storage, edge, state.origin_z, &span);
         const float* source = edge == view.brick_edge
-            ? view.d_phi + static_cast<std::size_t>(index) * base_voxels
+            ? view.d_phi + static_cast<std::size_t>(index) * base_stored_voxels
             : view.h_promoted_phi[index];
         for (std::size_t offset = 0; ok && offset < cell_voxels;
              offset += phase_stage_words) {
             const std::size_t words =
                 std::min(phase_stage_words, cell_voxels - offset);
-            ok = cuda_ok(cudaMemcpyAsync(
-                              phase_stage.data(), source + offset,
-                              words * sizeof(float),
-                              cudaMemcpyDeviceToHost, view.stream),
-                          "phase payload D2H") &&
-                 sync_stream(view.stream) &&
+            ok = unpack_phase_chunk(phase_stage.data(), source, span,
+                                    offset, words, view.stream) &&
                  write_exact(file, phase_stage.data(), words * sizeof(float),
                               "phase brick");
             if (ok) {

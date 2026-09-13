@@ -17,13 +17,34 @@ __device__ __forceinline__ std::size_t cell_words(int B) {
          * static_cast<std::size_t>(B);
 }
 
+// Launch/allocation validation proves these products fit. The hot device
+// path needs only the physical stride, not repeated overflow divisions.
+__device__ __forceinline__ std::size_t stored_cell_words(
+    int B, const CellFieldStorage3D& storage) {
+    return static_cast<std::size_t>(B) * static_cast<std::size_t>(B)
+         * static_cast<std::size_t>(storage.compact(B) ? storage.z_cap : B);
+}
+
 __device__ __forceinline__ std::size_t local_index(int x, int y, int z, int B) {
     return (static_cast<std::size_t>(z) * static_cast<std::size_t>(B)
             + static_cast<std::size_t>(y)) * static_cast<std::size_t>(B)
             + static_cast<std::size_t>(x);
 }
 
+// Update/scatter already resolve a valid world z. Reuse it rather than
+// reconstructing the same sum from the destination origin in each voxel.
+__device__ __forceinline__ std::size_t field_index_at_world_z(
+    int x, int y, int logical_z, int world_z, int B,
+    const CellFieldStorage3D& storage) {
+    return local_index(x, y, storage.compact(B) ? world_z : logical_z, B);
+}
+
 __device__ __forceinline__ int wrap_origin(std::int64_t origin, int n) {
+    // Most origins need no wrap or one negative wrap; retain modulo for
+    // arbitrary unwrapped trajectories. The validated period is positive.
+    if (origin >= 0 && origin < n) return static_cast<int>(origin);
+    if (origin < 0 && origin >= -static_cast<std::int64_t>(n))
+        return static_cast<int>(origin + n);
     std::int64_t value = origin % static_cast<std::int64_t>(n);
     if (value < 0) value += n;
     return static_cast<int>(value);
@@ -53,6 +74,31 @@ __device__ __forceinline__ bool checked_world_difference(
         (origin < 0 && world > INT64_MAX + origin))
         return false;
     *local = world - origin;
+    return true;
+}
+
+// Untiled diagnostic/recovery walks retain logical cube order. Planes that
+// compact storage omits are exact zero and must not be dereferenced.
+__device__ __forceinline__ float logical_field_value(
+    const float* field, std::size_t q, int B, std::int64_t origin_z,
+    const CellFieldStorage3D& storage) {
+    if (!storage.compact(B)) return field[q];
+    const std::size_t plane = static_cast<std::size_t>(B) * B;
+    const int logical_z = static_cast<int>(q / plane);
+    std::int64_t world_z = 0;
+    if (!checked_world_coordinate(origin_z, logical_z, &world_z) ||
+        world_z < 0 || world_z >= storage.z_cap) return 0.0f;
+    return field[static_cast<std::size_t>(world_z) * plane + q % plane];
+}
+
+__device__ __forceinline__ bool logical_z_from_stored(
+    int stored_z, int B, std::int64_t origin_z,
+    const CellFieldStorage3D& storage, int* logical_z) {
+    std::int64_t local = stored_z;
+    if (storage.compact(B) &&
+        !checked_world_difference(stored_z, origin_z, &local)) return false;
+    if (local < 0 || local >= B) return false;
+    *logical_z = static_cast<int>(local);
     return true;
 }
 

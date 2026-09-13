@@ -54,23 +54,30 @@ constexpr PromotedMeasureReduction3D decode_promoted_measure_reduction(
 enum class ReductionResumeResult {
     Ok,
     InvalidCheckpoint,
-    Mismatch
+    Mismatch,
+    InvalidRequest
 };
 
-// With no explicit resume flag, restore the stored policy. An explicit flag
-// is accepted only when it names the same policy; the stored automatic wave
-// remains authoritative in either case.
+// Restore the stored grouping unless an explicit policy change is authorized.
+// A changed automatic policy resolves on the destination device; requesting
+// the same automatic policy always preserves the checkpoint's stored wave.
 constexpr ReductionResumeResult resolve_promoted_measure_resume(
     const PromotedMeasureReduction3D& stored,
     bool option_was_supplied, int requested_policy,
-    PromotedMeasureReduction3D* resolved) {
+    PromotedMeasureReduction3D* resolved, bool allow_regroup = false) {
     if (!resolved ||
         !valid_checkpoint_promoted_measure_reduction(stored)) {
         return ReductionResumeResult::InvalidCheckpoint;
     }
-    if (option_was_supplied && requested_policy != stored.policy)
-        return ReductionResumeResult::Mismatch;
-    *resolved = stored;
+    if ((allow_regroup && !option_was_supplied) ||
+        (option_was_supplied && !valid_promoted_measure_policy(requested_policy)))
+        return ReductionResumeResult::InvalidRequest;
+    if (option_was_supplied && requested_policy != stored.policy) {
+        if (!allow_regroup) return ReductionResumeResult::Mismatch;
+        *resolved = {requested_policy, 0};
+    } else {
+        *resolved = stored;
+    }
     return ReductionResumeResult::Ok;
 }
 

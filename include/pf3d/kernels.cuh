@@ -1,11 +1,13 @@
 #pragma once
 
 // CUDA state and launch interfaces for the three-dimensional solver. Its
-// fields are dense x-fastest cubes, and updates stream small bricks through
-// shared memory instead of staging a whole cell.
+// Cell support is a logical cube; bounded geometries may store fewer z planes.
+// Fields are x-fastest. Updates stage halo tiles, not whole cells, in shared memory.
 
 #include "params.cuh"
+#include "phase_storage.hpp"
 #include "rng.cuh"
+#include "tile_partition.cuh"
 
 #include <cuda_runtime.h>
 
@@ -26,7 +28,8 @@ constexpr int kHaloVoxels = kHaloX * kHaloY * kHaloZ;
 
 // Brick kernels double-buffer halo tiles so global reads overlap stencil work.
 // Launches and occupancy queries must use this extent after raising the
-// per-kernel dynamic-shared-memory limit; the launch helpers do both.
+// per-kernel dynamic-shared-memory limit. Configure once on each device when
+// allocating a simulation; launch-only callers configure lazily on first use.
 constexpr std::size_t kHaloPipelineBytes =
     2u * static_cast<std::size_t>(kHaloVoxels) * sizeof(float);
 cudaError_t configure_tile_kernel_shared_memory();
@@ -159,6 +162,14 @@ struct SLayout3D {
     }
 };
 
+inline bool valid_field_storage(const CellFieldStorage3D& storage,
+                                 int B, const SLayout3D& layout) {
+    std::size_t bytes = 0;
+    return (storage.z_cap == 0 ||
+            (layout.bounded_z() && storage.z_cap == layout.nz)) &&
+           storage.checked_bytes(B, &bytes);
+}
+
 // Immutable channel-wall contribution already scaled by kappa_w/kappa.  Its
 // plane count is part of the launch contract so a channel kernel cannot infer
 // a profile from unrelated storage.
@@ -187,6 +198,21 @@ struct InitArgs3D {
     // Centered CPU-reference calibration; displaced float32 seeds are measured
     // before their first update and need not equal V0 exactly.
     float seed_radius;
+    CellFieldStorage3D storage{};
+};
+
+// Device indices into the global cell slots. The host must supply unique,
+// in-range indices. A null list selects all N slots; a non-null empty list
+// selects none. Field and partial-reduction storage remains globally indexed.
+struct CellSelection3D {
+    const int* ids = nullptr;
+    int count = 0;
+
+    PF3D_HD int selected_count(int N) const { return ids ? count : N; }
+    __device__ int cell_index(int slot) const { return ids ? ids[slot] : slot; }
+    __host__ bool valid(int N) const {
+        return ids == nullptr || (count >= 0 && count <= N);
+    }
 };
 
 struct ScatterArgs3D {
@@ -197,6 +223,8 @@ struct ScatterArgs3D {
     SLayout3D layout;
     int N;
     int B;
+    CellSelection3D selection;
+    CellFieldStorage3D storage{};
 };
 
 // One deterministic moment reduction produced by a spatial shard.  Low-cell-
@@ -237,6 +265,8 @@ struct MeasureArgs3D {
     // Surface needs the already-computed gradient but adds a square root per
     // voxel; evaluate it only on the configured full-moment/output cadence.
     bool compute_surface;
+    CellSelection3D selection;
+    CellFieldStorage3D storage{};
 };
 
 struct UpdateArgs3D {
@@ -264,6 +294,12 @@ struct UpdateArgs3D {
     // Normal stepping leaves this false; output paths measure the current
     // field explicitly through MeasureArgs3D::compute_surface.
     bool compute_surface;
+    CellSelection3D selection;
+    // Fast sharded slab updates may run Boundary then Interior with identical
+    // source/state/region. Only the first pass clears phi_out; S_out is external.
+    UpdateTilePass3D tile_pass = UpdateTilePass3D::All;
+    TileExchangeRegion3D exchange_region{};
+    CellFieldStorage3D storage{};
 };
 
 struct TrajPackedCell3D {
@@ -331,19 +367,24 @@ void k_measure_wall_diagnostics(const float* phi,
                             float* const* promoted_phi,
                             CellState3D* cells, int N, int B,
                             SLayout3D layout, const float* wall_psi_sq,
-                            int channel_height, int channel_padding);
+                            int channel_height, int channel_padding,
+                            CellFieldStorage3D storage = {});
 __global__ __launch_bounds__(kThreads3D, 1)
 void k_verify_cells(const float* phi, const CellState3D* cells,
-                    VerifyCell3D* out, int N, int B, SLayout3D layout);
+                    VerifyCell3D* out, int N, int B, SLayout3D layout,
+                    CellFieldStorage3D storage = {});
 __global__ __launch_bounds__(kThreads3D, 1)
 void k_verify_promoted(float* const* promoted_phi,
                        const CellState3D* cells, VerifyCell3D* out,
                        const int* promoted_ids, int N, int promoted_count,
-                       int promoted_edge, SLayout3D layout);
+                       int promoted_edge, SLayout3D layout,
+                       CellFieldStorage3D storage = {});
 __global__ void k_verify_S(const std::uint32_t* S, std::size_t words,
                            std::uint32_t* out_max);
 
 // Launch helpers validate the runtime brick edge before enqueueing work.
+// For pointer-backed launches, promoted_edge bounds every selected cell's
+// storage_edge; each CTA uses that cell's edge, not the maximum allocation.
 bool valid_runtime_geometry(int B, const SLayout3D& layout);
 void launch_initialize_spheres(const InitArgs3D& args, cudaStream_t stream = 0);
 void launch_clear_S(std::uint32_t* S, const SLayout3D& layout,
@@ -354,6 +395,15 @@ void launch_scatter_promoted(const ScatterArgs3D& args,
                              float* const* promoted_phi,
                              const int* promoted_ids, int promoted_count,
                              int promoted_edge, cudaStream_t stream = 0);
+// Candidates are centered cube crops; zero skips a cell. The caller clears
+// rejected[N]. Discarded voxels and eight retained planes at each crop face
+// must be exact zero; any nonfinite value also rejects, including stored planes
+// outside the physical domain. This protects the current state plus a guard,
+// not future bitwise equivalence to a larger cube; phi/state are unchanged.
+[[nodiscard]] bool launch_check_promoted_crops(
+    float* const* phi, const CellState3D* cells, const int* candidate_edges,
+    std::uint32_t* rejected, int N, int base_edge, cudaStream_t stream = 0,
+    CellFieldStorage3D storage = {});
 [[nodiscard]] bool launch_measure_cells(const MeasureArgs3D& args,
                                         cudaStream_t stream = 0);
 // Split form used when additional support tiers must be measured before the
@@ -374,7 +424,7 @@ void launch_apply_cell_motion(const MeasureArgs3D& args,
 [[nodiscard]] bool launch_update_tiled_sharded(
     const UpdateArgs3D& args, MomentPartial3D* partials,
     int shards_per_cell, cudaStream_t stream = 0);
-// scratch contains scratch_slots * B^3 floats.  The launcher uses exactly one
+// scratch contains scratch_slots * args.storage.words(B) floats. Exactly one
 // persistent block per slot; each block owns its slot for the whole kernel.
 [[nodiscard]] bool launch_update_inplace(const UpdateArgs3D& args,
                                          float* scratch, int scratch_slots,
@@ -410,15 +460,18 @@ void launch_measure_wall_diagnostics(const float* phi,
                                  const SLayout3D& layout,
                                  const float* wall_psi_sq,
                                  int channel_height, int channel_padding,
-                                 cudaStream_t stream = 0);
+                                 cudaStream_t stream = 0,
+                                 CellFieldStorage3D storage = {});
 void launch_verify_cells(const float* phi, const CellState3D* cells,
                          VerifyCell3D* out, int N, int B,
-                         const SLayout3D& layout, cudaStream_t stream = 0);
+                         const SLayout3D& layout, cudaStream_t stream = 0,
+                         CellFieldStorage3D storage = {});
 void launch_verify_promoted(float* const* promoted_phi,
                             const CellState3D* cells, VerifyCell3D* out,
                             const int* promoted_ids, int N, int promoted_count,
                             int promoted_edge, const SLayout3D& layout,
-                            cudaStream_t stream = 0);
+                            cudaStream_t stream = 0,
+                            CellFieldStorage3D storage = {});
 void launch_verify_S(const std::uint32_t* S, const SLayout3D& layout,
                      std::uint32_t* out_max, cudaStream_t stream = 0);
 
@@ -429,6 +482,7 @@ namespace detail {
 // behavior while compiling out post-update moment accumulation.
 [[nodiscard]] bool launch_update_tiled_fast(
     const UpdateArgs3D& args, int grid_blocks, cudaStream_t stream = 0);
+// Partial passes require both outputs and allow one or more spatial shards.
 [[nodiscard]] bool launch_update_tiled_sharded_fast(
     const UpdateArgs3D& args, int shards_per_cell, cudaStream_t stream = 0);
 [[nodiscard]] bool launch_update_inplace_fast(
@@ -437,7 +491,7 @@ namespace detail {
 // Sharded promoted throughput update: splits every pointer-backed cube among
 // shards_per_cell CTAs with the base sharded update's deterministic tile
 // assignment; outputs are bit-identical to launch_update_promoted's fast
-// path.  Clears the destination cubes itself.
+// path. Clears the destination cubes except when completing an Interior pass.
 [[nodiscard]] bool launch_update_promoted_sharded_fast(
     const UpdateArgs3D& args, float* const* promoted_phi_in,
     float* const* promoted_phi_out, const int* promoted_ids,

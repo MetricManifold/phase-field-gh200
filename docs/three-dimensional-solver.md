@@ -227,9 +227,11 @@ capacity in one population-wide occupancy wave, up to 64 blocks per cell. If
 one block per cell already spans multiple waves, it resolves to one. Values
 1--64 pin an explicit count. Because the count determines the floating-point moment-reduction
 grouping, it is stored in checkpoints and
-must remain unchanged across a continuation. The fast base and enlarged-cell
-updates may use up to 64 blocks per cell because they do not carry that
-reduction layout. Enlarged-cell measurement remains one block per cell by
+must remain unchanged across a continuation. Fast updates do not carry that
+reduction layout: bounded base-cell updates queue several occupancy waves,
+up to 512 blocks per cell, to balance uneven tile work. Periodic base and
+enlarged-cell updates use up to 64 blocks per cell by default.
+Enlarged-cell measurement remains one block per cell by
 default; `--promoted-measure-shards -1` enables an occupancy-derived,
 deterministic reduction with up to 64 blocks per cell. Aggregate-field updates
 remain exact Q5.27 integer additions.
@@ -255,7 +257,7 @@ between the measured and deferred-summary paths.
 
 ## Cell bricks and memory modes
 
-Each cell begins with a `B x B x B` phase-field brick. The initialized profile
+Each cell begins with a logical `B x B x B` phase-field brick. The initialized profile
 uses the effective radius `R_eff = R + 1/(2 k_lambda)`, with
 `k_lambda = sqrt(7.5)/lambda`, to match the `integral(phi^2 dV)` volume
 convention. The default edge contains this effective diameter, the diffuse tail
@@ -270,19 +272,25 @@ adjusted so every phase-field value retains the same world coordinate. The
 physical step and its run-and-tumble event are then retried. Large-cell storage
 is allocated only on demand and grows again if necessary, up to the HBM budget
 and the largest aligned cube smaller than the applicable periodic extent. In a
-channel, a local cube may exceed `H`; its out-of-domain z planes remain zero and
-do not enlarge the dense aggregate field. Base and enlarged
-cells share the same aggregate field and equations.
+channel, a logical cube may exceed `H`. Allocation uses `B x B x min(B,Nz)`
+values for either bounded geometry, where `Nz` includes the channel's solid
+padding. Omitted planes are implicit zeros; allocated wall-padding planes are
+retained. Ghost reflection, support checks, and logical reduction order are
+unchanged. Base and enlarged cells share the same aggregate field and equations.
 
-Let `P=4 N B^3` be one phase-field pool and let `G` be one padded, dense
-aggregate field. The solver offers three numerically equivalent layouts:
+Let `D(B)=min(B,Nz)` for bounded geometries and `D(B)=B` for periodic 3D.
+Then `P=4 N B^2 D(B)` is one phase-field pool; let `G` be one padded, dense
+aggregate field. The solver offers three numerically equivalent memory modes:
 
 - `throughput`: two phase pools and two aggregate fields, approximately
   `2P+2G` bytes;
 - `balanced`: one phase pool, two aggregate fields, and a bounded set of
-  per-CTA scratch bricks, approximately `P+2G+4sB^3` bytes;
+  per-CTA scratch bricks, approximately `P+2G+4sB^2 D(B)` bytes;
 - `compact`: one phase pool, one aggregate field, and scratch,
-  approximately `P+G+4sB^3` bytes.
+  approximately `P+G+4sB^2 D(B)` bytes.
+
+Here `s` is the number of scratch slots. Height-matched storage applies to all
+three modes; it is distinct from the one-aggregate `compact` memory mode.
 
 In the one-phase modes a persistent CUDA block completes one cell in a private
 scratch brick before copying it back. Other cells read only the immutable
@@ -301,16 +309,19 @@ In `auto` mode the selector first reserves enough headroom for one pair of
 first-tier enlarged cubes; it falls back to a base-only fit only when that
 reserve would otherwise prevent the requested system from starting.
 
-An enlarged cell uses two private phase cubes regardless of the base storage
-mode. If `K` cells currently use the common enlarged edge `E`, their additional
-storage is `8 K E^3` bytes. The original base slots remain allocated, so enough
+An enlarged cell uses two private phase allocations regardless of the base
+memory mode. Each enlarged cell has its own edge `E_i`; their additional
+storage is `8 sum_i(E_i^2 D(E_i))` bytes. The original base slots remain allocated, so enough
 headroom must be left for a transactional grow operation to allocate the new
 cubes before releasing the old ones.
 
 Checkpoint storage is separate from HBM capacity. With per-cell storage edges
 `B_n`, a checkpoint occupies
 `96 + 288 + sum_n(256 + 4 B_n^3)` bytes and is streamed through bounded host
-staging. Estimate the required filesystem space from this formula before
+staging. The on-disk format remains cubic: the writer expands omitted planes
+as exact zeros, and the loader rejects nonzero discarded planes. Height-matched
+GPU storage therefore does not reduce checkpoint size or change the format.
+Estimate the required filesystem space from this formula before
 enabling frequent checkpoints.
 
 ## Build and run
@@ -486,8 +497,10 @@ wall strength/width, padding, and lateral box size.
 
 ## Limits
 
-- One process advances one replica on one GPU; there is no spatial
-  decomposition or multi-GPU replica.
+- The default `cell_gh200_3d` executable advances one replica on one GPU.
+  An optional two-device executable partitions cells for substrate and
+  hard-wall channel geometries; periodic XYZ is not supported by that runner.
+  See the [two-GPU build, validation and limitations](../README.md#experimental-two-device-slab-and-channel-solver).
 - The mesh spacing, float32 phase field, and stencil are fixed numerical
   choices. Periodic XYZ, the fixed substrate slab, and the resolved steric-wall
   channel are the only geometries; they are not a general boundary-condition
@@ -501,9 +514,9 @@ wall strength/width, padding, and lateral box size.
   the last accepted in-memory state and stops the run before supported field
   values are clipped. Restart uses the last completed rolling checkpoint; the
   failed support check does not replace it.
-- Enlarged cells share one common cubic edge. Growth of that tier therefore
-  enlarges every cell already in it; strongly anisotropic or numerous enlarged
-  cells can exhaust HBM before their support approaches the domain size.
+- Each cell grows independently, but its logical support remains cubic rather
+  than fully anisotropic. Numerous enlarged cells can still exhaust HBM before
+  their support approaches the domain size.
 - An unrelated fatal error discovered during a `balanced` or `compact`
   in-place update can leave some device fields already updated. That state is
   never written as a checkpoint; restart from the last rolling checkpoint.

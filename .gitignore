@@ -24,6 +24,7 @@ trajectory*.txt
 checkpoint*.bin
 *.pf3d
 *.pfb
+*.pfb3d
 example-output/
 example-3d-output/
 initial_centres*.csv

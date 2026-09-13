@@ -1,24 +1,29 @@
 # Phase-field cell simulator for NVIDIA GH200
 
-This repository contains single-GPU CUDA implementations of the active
+The canonical repository is [SoftSimu/phase-field-gh200](https://github.com/SoftSimu/phase-field-gh200).
+It contains both the two- and three-dimensional solvers.
+
+This repository contains CUDA implementations of the active
 phase-field cell model. `cell_gh200` advances the two-dimensional formulation
 on a periodic square lattice. The separate `cell_gh200_3d` executable extends
 the same coefficient convention and run-and-tumble process to a periodic
 three-dimensional volume by default, with substrate-slab and two-hard-wall
 channel geometries selected explicitly.
 
-The implementation is specialized for one independent simulation replica on
-one NVIDIA GH200. It does not use MPI, NCCL, domain decomposition, or
-CUDA-aware MPI.
+The default executables run one independent simulation replica on one NVIDIA
+GH200. An optional two-device runner partitions whole cells between matching,
+peer-connected GPUs. Neither path uses MPI, NCCL, or CUDA-aware MPI.
 
 ## Executables and geometry modes
 
-The repository builds two solver executables, not one executable per geometry:
+The two default executables use dimension-specific numerical cores; a third,
+optional executable adds two-device coordination to the 3D core:
 
 | executable | numerical core | supported geometry |
 | --- | --- | --- |
 | `cell_gh200` | `pf_core` | periodic two-dimensional monolayer |
 | `cell_gh200_3d` | `pf3d_core` | periodic XYZ volume (default), substrate slab, or hard-wall channel |
+| `cell_gh200_3d_two_gpu` (optional) | `pf3d_core` | substrate slab or hard-wall channel on two peer-connected GPUs |
 
 All 3D geometries therefore share the same simulation
 state, adaptive storage, checkpoint/restart implementation, measurement code,
@@ -34,7 +39,7 @@ storage, random-counter domains, and update kernels remain dimension-specific.
 
 ## Model and numerical scheme
 
-For cell `n`, the phase field is advanced as
+For a two-dimensional cell `n`, the phase field is advanced as
 
 ```text
 dphi_n/dt = gamma_n lap(phi_n)
@@ -47,7 +52,7 @@ v_n = v_A p_n + (60 kappa/(xi lambda^2))
       integral(phi_n grad(phi_n) sum_(m!=n) phi_m^2 dA).
 ```
 
-Here `V_n = integral(phi_n^2 dA)` and `A0 = pi R^2`. The code uses `M=1/2`,
+Here `V_n = integral(phi_n^2 dA)` and `A0 = pi R^2`. The 2D code uses `M=1/2`,
 `dx=dy=1`, a nine-point isotropic Laplacian, centered gradients, periodic
 boundaries, and binary32 phase fields. Coefficients are defined once in
 [`include/params.cuh`](include/params.cuh). In particular, the interaction and
@@ -57,7 +62,7 @@ All lengths are expressed in lattice units (`dx=dy=1`, and `dz=1` in 3D) and
 time in the solver's nondimensional integration unit. Parameters are therefore
 model-unit inputs; this repository does not imply a mapping to physical units.
 
-Each CUDA thread block takes one cell at a time from a shared work queue. The
+In 2D, each CUDA thread block takes one cell at a time from a shared work queue. The
 normal update keeps the active rectangular field in shared memory. Cells that
 outgrow those classes use global-memory reads in the same queue, allowing their
 longer updates to overlap work on other cells without changing the equations
@@ -80,6 +85,15 @@ It offers throughput, balanced, and compact storage modes and an independent
 `PF3D` checkpoint format. Its equations, initialization, memory formulas, CLI,
 validation, and limitations are documented in
 [`docs/three-dimensional-solver.md`](docs/three-dimensional-solver.md).
+
+Logical cell support remains a `B x B x B` brick. In bounded-z geometries,
+each GPU phase-field allocation uses `B x B x min(B, Nz)` values; when `B > Nz`,
+the stored planes are indexed by computational world z. This includes the
+channel's solid padding, not just the physical wall separation. Throughput,
+balanced, and compact modes share this height-matched layout; their difference
+is the number of phase, aggregate, and scratch buffers. Exterior planes are
+implicit zero, while the boundary conditions and reflected stencil ghosts
+are unchanged. Checkpoint files retain the cubic phase-field layout.
 
 The slab is a nonadhesive 90-degree contact model. Related substrate-resolved
 phase-field treatments include [Monfared *et al.*, *eLife* 12:e82435
@@ -115,12 +129,19 @@ disabled, and neither recorder changes the model or checkpoint schema.
 
 ## Requirements
 
-- A CUDA 12.x toolkit and NVIDIA GPU supporting the requested CUDA architecture;
+- CUDA 12 or newer and an NVIDIA GPU supporting the requested CUDA architecture;
 - CMake 3.24 or newer and a C++17 compiler;
 - Python 3.10 or newer for the tests and command-line tools. The optional
   pinned visualization environment requires Python 3.11 or newer.
 
 The optimized default targets CUDA compute capability 9.0 (`sm_90`).
+The measured GH200 configurations below identify their tested compiler and
+toolkit versions; the minimum requirements are not a claim that every version
+or GPU has been validated.
+Windows builds with MSVC 19.44 and CUDA 12.5.82 also pass the host and
+checkpoint-I/O tests. That compiler emits register spills in some 2D
+specializations, so these build checks do not establish GH200 performance;
+use the measured toolchain when reproducing the reported timings.
 
 ## Build
 
@@ -146,6 +167,274 @@ FMA-contraction policy and prints the ptxas register/spill report. Check
 `build.log` for spill stores before using a new compiler build for production.
 The runtime may report a 32-byte local ABI frame when ptxas reports zero spill
 loads and stores; the frame itself is not a register spill.
+
+### Two-GPU communication probe
+
+`pf_peer_probe` is an optional fixed-scenario feasibility tool, not a two-GPU
+simulator. It validates peer access and measures flat transfers, direct
+pitched y-band transfers, and the checked Q5.27 merge used by a possible
+two-GPU substrate decomposition:
+
+```bash
+cmake -S . -B build-peer \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=90 \
+  -DPF_BUILD_PEER_PROBE=ON
+cmake --build build-peer --target pf_peer_probe --parallel 8
+./build-peer/pf_peer_probe --iterations 10 --warmup 3 > peer-results.json
+```
+
+The JSON records both devices and the fixed `N=100`, `R=49`, `rho_A=0.9`,
+`B=152`, `916 x 916 x 288` substrate scenario. Bidirectional bandwidth uses a
+common host-wall interval; per-direction CUDA-event medians are reported
+separately. These are component timings and do not establish an end-to-end
+two-GPU solver speedup.
+
+### Experimental two-device slab and channel solver
+
+`cell_gh200_3d_two_gpu` is an opt-in prototype, not a production release.
+It runs one substrate-slab or hard-wall-channel replica on two matching
+peer-connected GPUs. The single-device executables and their defaults remain
+unchanged.
+
+```bash
+cmake -S . -B build-two-gpu -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=90 -DPF_BUILD_TWO_GPU_SUBSTRATE=ON \
+  -DPF_ENABLE_GPU_TESTS=ON
+cmake --build build-two-gpu --parallel 8
+ctest --test-dir build-two-gpu -R '^pf3d_(owner_selection|tile_partition_cpu)$' --output-on-failure
+python tests/3d/run_two_gpu_smoke.py \
+  --reference build-two-gpu/cell_gh200_3d \
+  --executable build-two-gpu/cell_gh200_3d_two_gpu \
+  --output-dir build-two-gpu/two-gpu-smoke
+```
+
+The executable accepts the existing 3D CLI plus `--peer-device` (default 1);
+`--device` selects the primary GPU (default 0). This version supports only
+`--geometry slab` or `--geometry channel` and throughput storage; `auto` selects
+throughput. `--bench` measures a write-free window; timing a normal run also
+includes its regular integrity polls and any requested output.
+
+Whole cells are assigned by their allocated brick's midpoint in periodic y.
+Each GPU updates only its owned cells using the shared kernels. The exchange
+uses conservative allocated-brick bounds, not a phase-field cutoff, and joins
+the quantized overlap contributions with an overflow check. Ownership follows
+accepted recentering and adaptive support changes. Output and recovery gather
+the accepted state onto the primary GPU and use the ordinary checkpoint and
+trajectory routines. Reduction grouping remains fixed by the existing
+checkpoint contract; decomposition does not reseed the random generator.
+
+The channel uses the same two resolved steric-wall profiles, full cell volume,
+and three-dimensional polarity as the single-device solver. Both update passes
+include wall coupling; the peer exchange contains cell contributions only.
+Each device constructs its own immutable wall profile from the stored parameters.
+Channel exchange bounds include the padded computational height and do not wrap
+in z. A cell brick may exceed this height; its exchanged z range is clipped to
+the allocated domain. GPU phase-field storage omits the excess z planes, and
+kernels skip tiles outside the bounded z domain.
+
+The small channel comparison exercises both wall-coupled update passes,
+mixed brick sizes, active tumbles, projected boundaries, and checkpoint restart:
+
+```bash
+python tests/3d/run_two_gpu_channel_smoke.py \
+  --reference build-two-gpu/cell_gh200_3d \
+  --executable build-two-gpu/cell_gh200_3d_two_gpu \
+  --output-dir build-two-gpu/two-gpu-channel-smoke
+```
+
+The channel test passed on two GH200s: full checkpoints, trajectories, and
+maximum-projection boundaries were identical at 1, 10, and 100 active steps,
+including strict updates, split restarts, switching device count across restart,
+and mixed B24/B32 storage in a 16-voxel-high domain. Resume tests omit measurement
+overrides to exercise restoration of the saved grouping. These small tests do
+not establish long-run production behavior.
+
+Automatic growth is also tested after distributed stepping starts, with a cell
+on either owner or cells on both owners growing together. The recovery path
+retains the peer's base fields and shared workspaces, resizes only changed
+bricks, then refreshes every future peer-owned field from the accepted state.
+Shrinking, incompatible layouts, or insufficient temporary allocation headroom
+use the full-rebuild fallback. The comparison includes active tumbles, strict
+updates, exact checkpoints and observations, and split restart:
+
+```bash
+python tests/3d/run_two_gpu_growth_smoke.py \
+  --reference build-two-gpu/cell_gh200_3d \
+  --reference-two build-two-gpu/cell_gh200_3d_two_gpu \
+  --candidate-one build-two-gpu/cell_gh200_3d \
+  --executable build-two-gpu/cell_gh200_3d_two_gpu \
+  --output-dir build-two-gpu/two-gpu-growth-smoke
+```
+
+This command compares the current one- and two-device executables. For a
+cross-version regression, replace the two reference paths with separately
+built, pinned reference executables.
+
+Short write-free benchmarks on GH200 GPUs gave the following medians of two
+windows, bracketed by runs of the preceding implementation. Hours/tau use
+`dt=0.01` and `tau=10000`; they exclude initialization, growth and output costs.
+
+| Fixture | 1 GPU ms/step | 2 GPUs ms/step | 1 GPU hours/tau | 2 GPUs hours/tau |
+| --- | ---: | ---: | ---: | ---: |
+| N=40 substrate, evolved | 3.460 | 2.939 | 0.961 | 0.816 |
+| N=64 channel, evolved | 6.505 | 3.872 | 1.807 | 1.076 |
+| N=200 channel, fresh | 18.685 | 10.907 | 5.190 | 3.030 |
+
+The N=40 state is at 0.201 tau, with domain 580 x 580 x 288, R49,
+39 B160 cells and one B192 cell. The N=64 state is at 0.71 tau, with
+domain 733 x 733 x 140, R49, wall gap 98 and no promoted cells. Both use
+64 base measurement shards; the N=40 promoted measurement count is also 64.
+Their windows contain 100 accepted steps. The fresh N=200 channel has domain
+1296 x 1296 x 140, R49, wall gap 98, B160 and 64 base measurement shards.
+Its windows cover only the first 20 steps before support growth: they are
+not measurements of a mature N=200 state or a long-run forecast.
+
+Tile staging advances integer coordinates with row/plane carries, and
+measurements reuse fixed boundary maps. These changes reduced runtime by
+1.8–4.5% in the bracketed comparisons, without changing halo contents or
+measurement grouping. The build used CUDA 13.1.115 and `sm_90`, without
+fast-math or register spills; all timing guards passed without promotion or
+recovery. Ten-step continuations of both saved states produced byte-identical
+full checkpoints, trajectories and projected boundaries against the preceding
+implementation on one and two devices. The N=40 two-device 5+5 restart also
+matched. Height-matched storage saves 250 MiB of phase allocation per device
+in the N=64 fixture; checkpoint sizes are unchanged.
+
+This implementation replicates storage: it does not double cell capacity.
+Fast updates first process whole tiles intersecting the outgoing aggregate
+bands, then overlap peer copies with the remaining tiles. Classification uses
+source voxel coordinates, before recentering, so late tiles cannot modify a
+transmitted band. Both copies finish before either received aggregate is added.
+Strict measured updates retain their complete walk and reduction grouping.
+Bounded base updates automatically queue multiple occupancy waves of shorter
+tasks to balance uneven live-tile and boundary/interior work. This does not regroup any
+floating-point reduction; `--fast-base-shards` can override the task count.
+Enlarged-cell fast updates use the same queued-wave scheduler, with an automatic
+cap of 512 tasks per cell. `--promoted-shards 1..1024` pins their count. These
+settings do not change promoted measurement grouping or strict-update reductions.
+Metadata and integrity counters are still
+coordinated on the host each step, using reusable pinned snapshots and two
+joined download phases. Uploads precede their consumers in each device stream.
+Recentering refreshes exchange bounds without reinstalling unchanged owner lists.
+Healthy polls read control state without gathering fields; output, verification,
+and recovery materialize the canonical
+state and check integrity. It remains experimental, without a long-run
+production gate.
+
+`--bench-phases` reports the primary device's timeline. Its final phase includes
+interior updates, the exchange join, and pre-commit integrity coordination;
+fast-update phases cover only boundary tiles. The interstep gap includes
+post-commit coordination. These are not separate timings of every peer's work.
+
+On two GH200 GPUs, the supplied tests produced byte-identical single-/two-device
+checkpoints and trajectories for active tumbles, strict updates, split restart,
+mixed promoted/base storage, and migration across both y cuts with adaptive
+growth. The tests also cover cropped exchange, genuine boundary/interior tile
+work with split restart, routine polls between sparse outputs, and a partition
+with no owned cells. The test system
+uses four cells with `R=5`; this does not establish long-time accuracy or
+cross-hardware reproducibility.
+
+An earlier N=100 normal-run comparison, before the bounded-z measurement
+refinement below, used identical `R=49`,
+`rho_A=0.9`, `B=224`, `Nz=288`, `dt=0.01`, seed 20471, and four measurement
+shards on both executables. The table uses the automatic two-device scheduling
+policy and `--fast-base-shards 512` on the single-device executable:
+
+| Cells | One GPU (ms/step) | Two GPUs (ms/step) | Speedup |
+| --- | ---: | ---: | ---: |
+| 100 | 22.978 | 12.838 | 1.79× |
+
+With standard single-device scheduling, the corresponding time was about
+24.69 ms/step; that default remains
+unchanged. Explicit fast-update counts affect scheduling, not the pinned
+measurement reductions or checkpoint format.
+
+Each table value is the median of three runs with varied execution order. Host receipt
+timestamps span steps 32 to 288, including the usual 16-step integrity polls;
+trajectory and checkpoint writing are disabled. No promotions or recoveries
+occurred. These short fresh/evolving-state windows are not mature-state or
+long-run forecasts, and host-pipe jitter limits sub-percent comparisons.
+Both devices maintained 1,980 MHz SM clocks under load. Matching GPU names and
+SM counts alone does not establish equal throughput; clocks must also be checked.
+A smaller N=24 case with the same conservative brick edge gained essentially
+nothing from a second GPU. Do not extrapolate the N=100 gain to all populations
+or geometries.
+The tested build used CUDA 13.1.115, GNU 11.5 as CUDA host compiler, NVHPC 26.3
+for C++ tools, and `sm_90`, without fast-math or reported register spills.
+
+For N=250, precomputing the fixed bounded-z mapping avoids repeated world-coordinate
+checks in the base measurement kernel. Its integer interval and reflected-ghost
+rules are covered by a CPU oracle; the voxel order and floating-point reduction
+are unchanged. The same-grouping GPU tests compare exact checkpoints and
+trajectories, including restart, promotion and migration, with additional
+periodic and channel checks.
+
+With the same substrate geometry and timing protocol, three varied-order
+repetitions at 64 base measurement shards gave:
+
+| N=250 configuration | Median ms/step |
+| --- | ---: |
+| Previous two-device kernel, 64 measurement shards | 26.195 |
+| Bounded-z refinement, two devices, 64 measurement shards | 22.823 |
+| Bounded-z refinement, one device, 64 measurement shards, fast256 | 39.746 |
+
+The kernel refinement reduces two-device runtime by 12.9% at a fixed grouping.
+Together with scheduling, the time is 18.5% below the earlier four-shard
+two-device baseline (27.997 ms/step, a single same-job window). The resulting
+one-to-two-device speedup is 1.74x; it is not the N=100 result above.
+
+The **fresh N=250 substrate benchmark** used
+`--memory-mode throughput --measure-shards 64 --promoted-measure-shards 4`;
+leave `--fast-base-shards` unset so the two-device scheduler adapts to ownership.
+The benchmark had no promoted cells; four promoted measurement shards were
+held fixed, not optimized for a promoted-heavy state. Standard measurement
+defaults are unchanged. On continuation, omit a new measurement override and
+restore the checkpoint's stored grouping. For performance-oriented new runs,
+start with `--promoted-measure-shards -1` and benchmark an evolved state;
+the fresh benchmark does not establish four shards as a suitable long-run policy.
+
+Changing the measurement grouping changes floating-point summation and can
+select a different integer recentering at a rounding tie. Therefore local
+arrays need not match between groupings. The small four-versus-sixteen and
+four-versus-sixty-four checks had bit-identical phase fields after alignment
+to physical coordinates at steps 1, 10 and 100. This is not a cross-grouping
+long-time trajectory guarantee. Each fixed grouping remains restart-exact
+in the tested cases.
+
+`B=224` is a conservative benchmark allocation, **not an established production
+brick size for 3D**. Two-dimensional deformation limits do not establish it.
+Use evolved normal and soft cells to assess full diffuse-field support and
+the required margins before choosing campaign storage; retain adaptive growth
+without clipping. The timings above must not be extrapolated to mature,
+promoted-heavy, or differently confined systems without measurement.
+
+The independently sized brick implementation was also measured with smaller
+starting cubes, keeping N=250, the substrate geometry, physical parameters,
+two GPUs, and 64/4 measurement settings fixed. Two varied-order repetitions
+of the same 32-to-288-step timing window gave:
+
+| Starting brick edge | Median ms/step | Allocated GiB per GPU |
+| --- | ---: | ---: |
+| 224 | 22.840 | 25.51 |
+| 192 | 17.123 | 17.76 |
+| 176 | 15.402 | 14.73 |
+| 160 | 11.977 | 12.20 |
+
+These gains come from using smaller cubes, not from a faster update equation.
+The preceding implementation at B=224 measured 22.819 ms/step in the same
+job. None of these short timing windows required promotion. A separate
+2,000-step B=160 diagnostic with 25 soft cells among 250 completed with finite
+trajectories and no resizing; it is only 0.002 tau, not production equilibration
+or a long-time storage calibration. B=160 is a candidate for further diagnostics,
+not a proven universally sufficient size.
+
+Mixed-size growth, guarded cropping, memory recovery and checkpoint loading
+passed GPU tests. Small active one-/two-device runs matched checkpoints and
+trajectories across scheduled compaction, including split restarts in fast and
+strict update modes. Enable `PF_ENABLE_GPU_TESTS` to build the retained
+`pf3d_adaptive_bricks_gpu` test; the size-policy CPU test runs by default.
 
 For `cell_gh200` (2D), the production build excludes the high-frequency
 `support_clip` instrumentation. Fail-closed checks for overflow, non-finite
@@ -345,19 +634,26 @@ appending to a trajectory created with a different cadence is rejected.
 
 `cell_gh200_3d` writes geometry-specific text trajectories and independent
 `.pf3d` checkpoints with a required complete-file CRC-64 checksum. Each
-checkpoint contains every cell's actual storage edge, phase field, unwrapped
+checkpoint contains every cell's logical brick edge, phase field, unwrapped
 origin, velocity, polarity, identity, and the accepted step. Starting twice
 from the same checkpoint with the same executable and parameters therefore
 replays the same counter-based run-and-tumble events. The checkpoint stores the
 resolved base-measurement count and promoted-measurement reduction policy so a
 restart cannot silently change floating-point grouping. Explicit conflicting
-`--measure-shards` or `--promoted-measure-shards` values are rejected. Channel
+`--measure-shards` or `--promoted-measure-shards` values are rejected by default. Channel
 checkpoints also store the accessible height, solid padding, wall strength, and
 wall width. The resolved trajectory cadence is restored unless a new cadence
 is supplied explicitly on resume. Changing it requires a new `--out` path;
 appending to a trajectory created with a different cadence is rejected. The
 public reader accepts only this current PF3D format and cannot read or overwrite
 a 2D checkpoint.
+
+The on-disk phase payload remains `B^3` float32 values per cell, independent of
+GPU storage mode. Writing expands omitted z planes as zero through a bounded
+host buffer. Loading packs the retained planes and rejects nonzero or nonfinite
+values outside the compact allocation; the complete-file checksum still
+covers every serialized plane. Height-matched GPU storage therefore saves
+device memory, not checkpoint disk space.
 
 All three-dimensional trajectories use schema 1 with an explicit geometry
 token. Periodic x/y/z coordinates remain unwrapped, while slab x/y coordinates
@@ -370,6 +666,88 @@ is `P_w=sum_i W_i/sum_i V_i`. Two further columns report the phase-field
 volume outside the physical slit and its fraction of `V_i`, which is the direct
 penetration diagnostic. Geometry flags and dimensions are stored in the
 checkpoint.
+
+### Tuning measurement of enlarged cells
+
+Base and enlarged cells have separate measurement policies. A small number of
+enlarged cells can underutilize the GPU with a low fixed
+`--promoted-measure-shards` count. `-1` selects an occupancy-derived count
+(up to 64); a positive value pins the count. Benchmark an evolved state, since
+a fresh run may have no enlarged cells at all.
+
+To retune an existing checkpoint, supply both `--promoted-measure-shards`
+and `--allow-promoted-measure-regroup`. The latter explicitly permits a change
+in floating-point summation order. It preserves the loaded phase fields, cell
+identities, model parameters, simulation step and tumble stream; derived
+moments and velocities are recomputed. Subsequent floating-point trajectories
+need not be identical to those using the previous grouping.
+
+Keep the input checkpoint and write to a new trajectory/checkpoint directory.
+New checkpoints store the selected policy, so later restarts can omit both
+flags. Repeating an unchanged automatic policy preserves its stored occupancy
+wave. Base-cell grouping is unaffected. Without the opt-in, incompatible
+groupings remain errors; mismatched trajectory appends are always refused.
+
+For example, retune a checkpoint at simulation time 2000 and continue to 2010
+in a new output directory:
+
+```sh
+mkdir retuned
+build/cell_gh200_3d -c checkpoint.pf3d --t-end 2010 \
+  --memory-mode throughput --promoted-measure-shards 64 \
+  --allow-promoted-measure-regroup \
+  --out retuned/trajectory.txt --checkpoint-dir retuned/checkpoints
+```
+
+An evolved N=40 substrate state at `t=0.2*tau`, with 39 cells in B=160
+cubes and one in B=192, was measured on GH200 with 64 base-measurement shards.
+Each entry is the median of two 200-step write-free windows, tested in opposite
+orders; all timing guards passed. At `dt=0.01` and `tau=10000`:
+
+| Promoted measurement shards | One GPU, ms/step | Two GPUs, ms/step |
+| --- | ---: | ---: |
+| 4 | 8.929 | 7.802 |
+| 64 | 4.530 | 3.479 |
+| Automatic (`-1`) | 4.552 | 3.489 |
+
+The fixed-64 result projects to 1.26 hours per tau on one GPU and 0.97 hours
+on two, excluding output time. It is a measurement of this mixed-size state,
+not a guarantee for other populations or later cell shapes. Using two GPUs
+reduces elapsed time but uses about 1.54 times as many GPU-hours here.
+On this checkpoint, the 4-to-64 change preserved the initial fields exactly;
+after 1000 steps the two runs also had identical fields in world coordinates,
+polarities, and tumble counters. This short comparison does not establish
+long-time bitwise equivalence between reduction policies.
+
+The retained smoke test checks unchanged initial fields, matching active
+tumble events and polarities, checkpoint-policy restoration, and split restart:
+
+```sh
+python tests/3d/run_promoted_regroup_smoke.py \
+  --executable build/cell_gh200_3d --output-dir regroup-smoke
+```
+
+Add `--two-gpu-executable build/cell_gh200_3d_two_gpu` to exercise the
+two-device continuation and gathered state as well. The test requires suitable
+GPU resources; it does not submit a scheduler job.
+
+### Compact projected boundaries
+
+Add `--boundary-out boundaries.pfb3d --boundary-interval 1000` to save
+the actual `phi=0.5` top-down contours without writing full 3D fields.
+`--boundary-projection maximum` (default) records each cell's silhouette;
+`--boundary-projection basal` records its footprint at the substrate plane
+and is available only with `--geometry slab`. Both retain cell IDs and
+unwrapped origins for periodic reconstruction. This is an optional observer:
+it does not change initialization, integration, or tumble events.
+
+The stream includes the initial state, the requested absolute step cadence,
+and the final state. Use a new file for each restart segment. Inspect it with
+`python tools/pf3d_boundary.py boundaries.pfb3d`; the reader also exposes frames
+for analysis. Projected boundaries are input for neighbor-exchange analysis,
+not automatically a 3D contact graph or a T1-event classification.
+See [the format and usage guide](docs/boundary-output-3d.md) for projection
+semantics, optional lossless zstd compression, and tests.
 
 ### Rendering a substrate checkpoint
 
@@ -433,11 +811,11 @@ ctest --test-dir build -C Release --output-on-failure \
 
 - The build defaults to `sm_90`; other GPU architectures and toolchains
   require independent verification.
-- One process controls one GPU and one replica. Multi-GPU execution means
-  independent processes; a single replica is not spatially decomposed.
+- The default executables use one GPU per replica. The optional two-device
+  slab/channel prototype above is not yet validated for production.
 - The square periodic lattice and unit spacing are fixed numerical constraints
   enforced at runtime, not general mesh options.
-- The 3D extension uses a unit lattice and one GPU. Periodic XYZ remains the
+- The 3D extension uses a unit lattice. Periodic XYZ remains the
   default; the alternatives are the fixed substrate slab and the resolved
   steric two-wall channel. They are numerically separate from the original
   two-dimensional monolayer model.
@@ -445,12 +823,26 @@ ctest --test-dir build -C Release --output-on-failure \
   fallback a guarded capacity of 278 pixels per axis. An active fallback may
   continue up to its 286-pixel physical interior with a nonfatal warning;
   wider detected support aborts rather than being repacked or clipped.
-- The 3D solver promotes cells that exhaust the base brick into a common
-  enlarged-storage tier. Their base slots remain allocated, and enlarging the
-  tier temporarily requires both its old and new phase-field pools. Growth is
+- The 3D solver enlarges each cell's cube independently. Growth adds roughly
+  32 planes to the edge, rounded to a 16-plane size class (the final
+  domain-limited class can use the underlying eight-plane alignment). Every
+  1024 accepted steps it considers smaller cubes, retaining 16 planes around
+  the measured support bounds. A GPU check additionally requires every
+  discarded voxel and an eight-plane inner guard to be exactly zero, and
+  rejects nonfinite fields. Cells whose tails do not fit remain unchanged.
+  Resizing preserves the current world-coordinate field; changing its local
+  cube can change floating-point moment reductions and is not guaranteed to
+  reproduce a trajectory computed in a permanently larger cube.
+  Each cell's edge is already stored in the checkpoint; the compaction schedule
+  uses absolute steps and needs no additional checkpoint history.
+  Base slots remain allocated. An existing checkpoint cannot shrink below
+  its base edge, so a uniform B=224 checkpoint does not automatically gain
+  smaller storage. Replacement allocation temporarily requires old and new
+  buffers; optional compaction is postponed if that exceeds the budget. Growth is
   bounded by the configured HBM budget and by the periodic domain extents. A
-  channel brick may exceed the wall separation because out-of-domain z planes
-  are not stored in the aggregate field. If either applicable bound is reached, the run
+  channel brick may exceed the wall separation; the solid padding is retained,
+  while planes outside the computational z domain are omitted from GPU phase
+  and aggregate storage. If either applicable bound is reached, the run
   restores the last accepted in-memory state and exits without clipping it;
   restart uses the last completed rolling checkpoint.
 - The slab has neutral contact but no adhesion, and constrains translation and
@@ -473,7 +865,7 @@ it.
 Citation metadata is provided in [`CITATION.cff`](CITATION.cff). Publication
 venue and DOI are intentionally omitted until they exist.
 
-No third-party source is vendored. CUDA, CMake, and Python remain under
+No third-party source is vendored. CUDA, CMake, Python, and optional zstd remain under
 their respective licenses. The counter-based generator implements the
 Philox4x32-10 algorithm described by Salmon *et al.*, “Parallel random numbers:
 as easy as 1, 2, 3,” SC '11, [doi:10.1145/2063384.2063405](https://doi.org/10.1145/2063384.2063405).

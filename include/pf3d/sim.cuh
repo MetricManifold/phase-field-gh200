@@ -1,6 +1,7 @@
 #pragma once
 
 #include "checkpoint.cuh"
+#include "boundary_output.cuh"
 #include "initializer.hpp"
 #include "kernels.cuh"
 #include "palmieri_initializer.hpp"
@@ -12,8 +13,10 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace pf3d {
@@ -56,8 +59,11 @@ struct RunOptions3D {
     // the one-CTA fold.
     int promoted_measure_shards = 0;
     bool promoted_measure_shards_supplied = false;
+    // Resume-only opt-in; requires an explicitly requested promoted policy.
+    // Allows different floating-point grouping, not new fields or RNG state.
+    bool allow_promoted_measure_regroup = false;
     // Resolved occupancy wave restored from an automatic-policy checkpoint.
-    // Fresh runs leave this zero and derive it from the selected device.
+    // Fresh runs and changes to automatic leave zero for device resolution.
     int promoted_measure_auto_wave_ctas = 0;
     int print_interval = 100;
     long long trajectory_interval = 0;
@@ -67,6 +73,10 @@ struct RunOptions3D {
     std::string trajectory_path;
     std::string checkpoint_dir;
     std::string initial_centres_path;
+    std::string boundary_path;
+    long long boundary_interval = 0;
+    boundary::Projection boundary_projection = boundary::Projection::Maximum;
+    bool boundary_compress = false;
 };
 
 class Sim3D {
@@ -98,6 +108,7 @@ public:
 
 private:
     friend struct Sim3DTestAccess;
+    friend class TwoGpuSim3D;
     bool allocate(const SimParams3D& params, const RunOptions3D& options,
                   int requested_brick_edge, bool need_initial_centres,
                   std::optional<int> checkpoint_measure_shards);
@@ -109,9 +120,14 @@ private:
                               bool apply_motion = true);
     bool ensure_measurements(bool require_surface, const char* context);
     bool launch_one_step();
+    bool begin_step(const TileExchangeRegion3D* exchange_region = nullptr);
+    bool enqueue_interior_update();
+    bool finish_step();
+    const int* active_promoted_ids() const;
+    int active_promoted_count() const;
     int promoted_update_shards(int promoted_count) const;
     int promoted_measure_shard_count(int promoted_count) const;
-    int fast_base_update_shards() const;
+    int fast_base_update_shards(UpdateTilePass3D pass) const;
     bool phase_mark(int slot);
     void clear_phase_events() noexcept;
     bool bench_phase_report(int steps);
@@ -120,16 +136,15 @@ private:
     bool recover_support_exhaustion(
         const std::vector<std::uint32_t>& flags);
     bool install_checkpoint_promotions(const CheckpointMeta3D& checkpoint);
-    bool allocate_promoted_fields(const std::vector<int>& cell_ids,
-                                  std::vector<CellState3D>* states);
-    bool grow_promoted_fields(int new_edge,
-                              const std::vector<int>& additional_cell_ids,
-                              std::vector<CellState3D>* states);
+    bool resize_cells(const std::vector<std::pair<int, int>>& requested,
+                      std::vector<CellState3D>* states);
+    bool compact_promoted_fields();
     bool upload_promoted_tables();
     bool open_trajectory();
     bool append_trajectory();
     void close_trajectory();
     bool checkpoint_at_current_state(const std::string& path);
+    bool append_boundary();
     const float* current_phi() const;
     float* current_phi();
     std::uint32_t* current_S();
@@ -137,8 +152,11 @@ private:
 
     SimParams3D params_{};
     RunOptions3D options_{};
+    std::unique_ptr<BoundaryOutput3D> boundary_output_;
+    std::uint64_t last_boundary_step_ = 0;
     StorageMode3D selected_mode_ = StorageMode3D::Auto;
     SLayout3D layout_{};
+    CellFieldStorage3D field_storage_{};
     int B_ = 0;
     int phi_buffers_ = 0;
     int S_buffers_ = 0;
@@ -148,12 +166,11 @@ private:
     int current_promoted_phi_index_ = 0;
     int update_grid_blocks_ = 0;
     int measurement_shards_ = 1;
-    int throughput_update_shards_ = 1;
     std::size_t brick_words_ = 0;
     std::size_t S_words_ = 0;
     std::size_t required_device_bytes_ = 0;
     std::size_t adaptive_budget_remaining_ = 0;
-    std::size_t promoted_words_ = 0;
+    // Maximum logical adaptive edge; each cell owns its bounded allocation.
     int promoted_edge_ = 0;
     int maximum_support_edge_ = 0;
     int sm_count_ = 0;
@@ -171,6 +188,16 @@ private:
     std::uint64_t steps_done_ = 0;
     bool volume_current_ = true;
     bool surface_current_ = true;
+    CellSelection3D selection_{};
+    int* d_owned_promoted_ids_ = nullptr;
+    int owned_promoted_count_ = -1;
+    UpdateArgs3D pending_update_{};
+    bool pending_measured_update_ = false;
+    bool step_pending_ = false;
+    // Gathering materializes fields for output, verification, or recovery, not
+    // healthy polls. It is idempotent until the next distributed step.
+    std::function<bool()> distributed_step_;
+    std::function<bool()> gather_state_;
 
     float* d_phi_[2] = {nullptr, nullptr};
     float** d_promoted_phi_[2] = {nullptr, nullptr};

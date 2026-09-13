@@ -36,6 +36,14 @@ option(PF_BUILD_3D "Build the separate three-dimensional simulator" ON)
 option(PF_ENABLE_CHECKPOINT_IO_TESTS
   "Register checkpoint I/O tests that stage through any CUDA device without launching kernels" OFF)
 option(PF_ENABLE_GPU_TESTS "Register the public CUDA smoke tests" OFF)
+# Standalone two-GPU communication probe; it is not part of the simulator.
+option(PF_BUILD_PEER_PROBE
+       "Build the optional two-GPU CUDA peer bandwidth probe" OFF)
+option(PF_BUILD_TWO_GPU_SUBSTRATE
+       "Build the experimental two-device slab/channel simulator" OFF)
+if(PF_BUILD_TWO_GPU_SUBSTRATE AND NOT PF_BUILD_3D)
+  message(FATAL_ERROR "PF_BUILD_TWO_GPU_SUBSTRATE requires PF_BUILD_3D")
+endif()
 
 add_library(pf_shape_config INTERFACE)
 if(PF_DIAGNOSTIC_ALARMS)
@@ -110,12 +118,29 @@ set_target_properties(cell_gh200 PROPERTIES
 pf_enable_warnings(cell_gh200)
 
 if(PF_BUILD_3D)
+  add_library(pf3d_boundary STATIC src/pf3d/boundary_output.cu)
+  target_include_directories(pf3d_boundary PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/common)
+  target_compile_options(pf3d_boundary PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+  set_target_properties(pf3d_boundary PROPERTIES
+    CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+  pf_enable_warnings(pf3d_boundary)
+  find_path(PF_ZSTD_INCLUDE_DIR zstd.h)
+  find_library(PF_ZSTD_LIBRARY NAMES zstd libzstd)
+  if(PF_ZSTD_INCLUDE_DIR AND PF_ZSTD_LIBRARY)
+    target_include_directories(pf3d_boundary PRIVATE ${PF_ZSTD_INCLUDE_DIR})
+    target_link_libraries(pf3d_boundary PRIVATE ${PF_ZSTD_LIBRARY})
+    target_compile_definitions(pf3d_boundary PRIVATE PF_BOUNDARY_ZSTD=1)
+  endif()
   add_library(pf3d_core STATIC
+    src/pf3d/adaptive_storage.cu
     src/pf3d/kernels.cu
     src/pf3d/kernels_periodic_slab_walk.cu
     src/pf3d/sim.cu
     src/pf3d/checkpoint.cu)
   target_link_libraries(pf3d_core PUBLIC pf_shape_config)
+  target_link_libraries(pf3d_core PRIVATE pf3d_boundary)
   target_include_directories(pf3d_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/common)
@@ -132,6 +157,17 @@ if(PF_BUILD_3D)
   set_target_properties(cell_gh200_3d PROPERTIES
     CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
   pf_enable_warnings(cell_gh200_3d)
+  if(PF_BUILD_TWO_GPU_SUBSTRATE)
+    add_executable(cell_gh200_3d_two_gpu
+      src/pf3d/main.cu src/pf3d/two_gpu_sim.cu)
+    target_link_libraries(cell_gh200_3d_two_gpu PRIVATE pf3d_core)
+    target_compile_definitions(cell_gh200_3d_two_gpu PRIVATE PF_TWO_GPU_SUBSTRATE=1)
+    target_compile_options(cell_gh200_3d_two_gpu PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+    set_target_properties(cell_gh200_3d_two_gpu PROPERTIES
+      CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+    pf_enable_warnings(cell_gh200_3d_two_gpu)
+  endif()
 endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC")
@@ -185,6 +221,10 @@ if(PF_BUILD_3D)
   target_compile_options(cell_gh200_3d PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:${PF_HOST_NO_CONTRACTION}>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${PF_CUDA_HOST_NO_CONTRACTION}>)
+  if(TARGET cell_gh200_3d_two_gpu)
+    target_compile_options(cell_gh200_3d_two_gpu PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${PF_CUDA_HOST_NO_CONTRACTION}>)
+  endif()
 endif()
 
 if(PF_BUILD_TOOLS)
@@ -357,6 +397,94 @@ if(BUILD_TESTING)
     pf_enable_warnings(pf3d_measure_shards_cpu_test)
     add_test(NAME pf3d_measure_shards_cpu
       COMMAND pf3d_measure_shards_cpu_test)
+    add_executable(pf3d_promoted_regroup_cpu_test
+      tests/3d/promoted_regroup_cpu_test.cpp)
+    target_include_directories(pf3d_promoted_regroup_cpu_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/common)
+    pf_enable_warnings(pf3d_promoted_regroup_cpu_test)
+    add_test(NAME pf3d_promoted_regroup_cpu COMMAND pf3d_promoted_regroup_cpu_test)
+
+    add_executable(pf3d_substrate_planner_cpu_test
+      tests/3d/substrate_planner_cpu_test.cpp)
+    target_include_directories(pf3d_substrate_planner_cpu_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/common)
+    pf_enable_warnings(pf3d_substrate_planner_cpu_test)
+    if(PF_HOST_NO_CONTRACTION_KNOWN)
+      target_compile_options(pf3d_substrate_planner_cpu_test PRIVATE
+        ${PF_HOST_NO_CONTRACTION})
+    endif()
+    add_test(NAME pf3d_substrate_planner_cpu
+      COMMAND pf3d_substrate_planner_cpu_test)
+
+    add_executable(pf3d_tile_partition_cpu_test
+      tests/3d/tile_partition_cpu_test.cpp)
+    target_include_directories(pf3d_tile_partition_cpu_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/common)
+    pf_enable_warnings(pf3d_tile_partition_cpu_test)
+    add_test(NAME pf3d_tile_partition_cpu
+      COMMAND pf3d_tile_partition_cpu_test)
+
+    add_executable(pf3d_bounded_z_map_cpu_test
+      tests/3d/bounded_z_map_cpu_test.cpp)
+    target_include_directories(pf3d_bounded_z_map_cpu_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    pf_enable_warnings(pf3d_bounded_z_map_cpu_test)
+    add_test(NAME pf3d_bounded_z_map_cpu
+      COMMAND pf3d_bounded_z_map_cpu_test)
+
+    add_executable(pf3d_phase_storage_cpu_test tests/3d/phase_storage_cpu_test.cpp)
+    target_include_directories(pf3d_phase_storage_cpu_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    pf_enable_warnings(pf3d_phase_storage_cpu_test)
+    add_test(NAME pf3d_phase_storage_cpu COMMAND pf3d_phase_storage_cpu_test)
+
+    add_executable(pf3d_brick_classes_cpu_test tests/3d/brick_classes_cpu_test.cpp)
+    target_include_directories(pf3d_brick_classes_cpu_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/common)
+    pf_enable_warnings(pf3d_brick_classes_cpu_test)
+    add_test(NAME pf3d_brick_classes_cpu COMMAND pf3d_brick_classes_cpu_test)
+
+    if(PF_ENABLE_GPU_TESTS)
+      add_executable(pf3d_boundary_output_test tests/3d/boundary_output_gpu_test.cu)
+      target_link_libraries(pf3d_boundary_output_test PRIVATE pf3d_boundary)
+      target_compile_options(pf3d_boundary_output_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+      set_target_properties(pf3d_boundary_output_test PROPERTIES
+        CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+      pf_enable_warnings(pf3d_boundary_output_test)
+      add_test(NAME pf3d_boundary_output_gpu COMMAND pf3d_boundary_output_test)
+      set_tests_properties(pf3d_boundary_output_gpu PROPERTIES SKIP_RETURN_CODE 77)
+      add_executable(pf3d_adaptive_bricks_test tests/3d/adaptive_bricks_test.cu)
+      target_link_libraries(pf3d_adaptive_bricks_test PRIVATE pf3d_core)
+      target_compile_options(pf3d_adaptive_bricks_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+      set_target_properties(pf3d_adaptive_bricks_test PROPERTIES
+        CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+      pf_enable_warnings(pf3d_adaptive_bricks_test)
+      add_test(NAME pf3d_adaptive_bricks_gpu COMMAND pf3d_adaptive_bricks_test)
+      set_tests_properties(pf3d_adaptive_bricks_gpu PROPERTIES SKIP_RETURN_CODE 77)
+      add_executable(pf3d_phase_storage_gpu_test tests/3d/phase_storage_gpu_test.cu)
+      target_link_libraries(pf3d_phase_storage_gpu_test PRIVATE pf3d_core)
+      target_compile_options(pf3d_phase_storage_gpu_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+      set_target_properties(pf3d_phase_storage_gpu_test PROPERTIES
+        CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+      pf_enable_warnings(pf3d_phase_storage_gpu_test)
+      add_test(NAME pf3d_phase_storage_gpu COMMAND pf3d_phase_storage_gpu_test)
+      set_tests_properties(pf3d_phase_storage_gpu PROPERTIES SKIP_RETURN_CODE 77)
+      add_executable(pf3d_wrap_origin_gpu_test tests/3d/wrap_origin_gpu_test.cu)
+      target_include_directories(pf3d_wrap_origin_gpu_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/common)
+      target_compile_options(pf3d_wrap_origin_gpu_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+      set_target_properties(pf3d_wrap_origin_gpu_test PROPERTIES
+        CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+      pf_enable_warnings(pf3d_wrap_origin_gpu_test)
+      add_test(NAME pf3d_wrap_origin_gpu COMMAND pf3d_wrap_origin_gpu_test)
+      set_tests_properties(pf3d_wrap_origin_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 
     add_executable(pf3d_wall_field_contract_test
       tests/3d/wall_field_contract_test.cu)
@@ -380,10 +508,46 @@ if(BUILD_TESTING)
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/3d/checkpoint_header_python_test.py
         --fixture-writer $<TARGET_FILE:pf3d_checkpoint_header_fixture>)
+    add_test(NAME pf3d_boundary_format_python
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/3d/boundary_format_python_test.py)
 
     # Executable-level option parsing; all cases stop before device setup.
     set(pf3d_cli_runner
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/3d/run_cli_case.cmake)
+    foreach(pf3d_regroup_case fresh missing_policy)
+      if(pf3d_regroup_case STREQUAL "fresh")
+        set(pf3d_regroup_args "--allow-promoted-measure-regroup;--promoted-measure-shards;64")
+      else()
+        set(pf3d_regroup_args "--allow-promoted-measure-regroup;--checkpoint;absent.pf3d")
+      endif()
+      add_test(NAME pf3d_promoted_regroup_cli_${pf3d_regroup_case}
+        COMMAND ${CMAKE_COMMAND}
+          -DEXE=$<TARGET_FILE:cell_gh200_3d>
+          "-DCASE_ARGS=${pf3d_regroup_args}" -DEXPECT_CODE=2
+          "-DEXPECT_LINE=[3d] --allow-promoted-measure-regroup requires --checkpoint and explicit --promoted-measure-shards"
+          -P ${pf3d_cli_runner})
+    endforeach()
+    function(pf3d_boundary_cli_test name args diagnostic)
+      add_test(NAME pf3d_boundary_cli_${name}
+        COMMAND ${CMAKE_COMMAND}
+          -DEXE=$<TARGET_FILE:cell_gh200_3d>
+          "-DCASE_ARGS=${args}" -DEXPECT_CODE=2
+          "-DEXPECT_LINE=[3d] ${diagnostic}" -P ${pf3d_cli_runner})
+    endfunction()
+    pf3d_boundary_cli_test(missing_interval "--boundary-out;boundary.raw"
+      "boundary output requires --boundary-out and --boundary-interval")
+    pf3d_boundary_cli_test(missing_path "--boundary-interval;7"
+      "boundary output requires --boundary-out and --boundary-interval")
+    pf3d_boundary_cli_test(projection "--boundary-projection;voronoi"
+      "--boundary-projection expects maximum or basal")
+    pf3d_boundary_cli_test(compression "--boundary-compression;lossy"
+      "--boundary-compression expects none or zstd")
+    pf3d_boundary_cli_test(bench "--boundary-out;boundary.raw;--boundary-interval;7;--bench;1"
+      "boundary output cannot be combined with --bench")
+    pf3d_boundary_cli_test(basal_periodic
+      "--boundary-out;boundary.raw;--boundary-interval;7;--boundary-projection;basal"
+      "basal boundary output requires --geometry slab")
     foreach(pf3d_ms_bad -2 65 eleven)
       add_test(NAME pf3d_measure_shards_cli_invalid_${pf3d_ms_bad}
         COMMAND ${CMAKE_COMMAND}
@@ -417,6 +581,15 @@ if(BUILD_TESTING)
         COMMAND pf3d_measure_shards_checkpoint_test)
       set_tests_properties(pf3d_measure_shards_checkpoint PROPERTIES
         SKIP_RETURN_CODE 77)
+      add_executable(pf3d_phase_storage_io_test tests/3d/phase_storage_io_test.cu)
+      target_link_libraries(pf3d_phase_storage_io_test PRIVATE pf3d_core)
+      target_compile_options(pf3d_phase_storage_io_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+      set_target_properties(pf3d_phase_storage_io_test PROPERTIES
+        CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+      pf_enable_warnings(pf3d_phase_storage_io_test)
+      add_test(NAME pf3d_phase_storage_io COMMAND pf3d_phase_storage_io_test)
+      set_tests_properties(pf3d_phase_storage_io PROPERTIES SKIP_RETURN_CODE 77)
     endif()
   endif()
 
@@ -429,14 +602,51 @@ if(BUILD_TESTING)
         --executable $<TARGET_FILE:cell_gh200>)
     set_tests_properties(gh200_smoke PROPERTIES TIMEOUT 180)
     if(PF_BUILD_3D)
+      if(PF_BUILD_TWO_GPU_SUBSTRATE)
+        add_executable(pf3d_owner_selection_test tests/3d/two_gpu_selection_test.cu)
+        target_link_libraries(pf3d_owner_selection_test PRIVATE pf3d_core)
+        target_compile_options(pf3d_owner_selection_test PRIVATE
+          $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+        set_target_properties(pf3d_owner_selection_test PROPERTIES
+          CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+        pf_enable_warnings(pf3d_owner_selection_test)
+        add_test(NAME pf3d_owner_selection COMMAND pf3d_owner_selection_test)
+        set_tests_properties(pf3d_owner_selection PROPERTIES SKIP_RETURN_CODE 77)
+      endif()
       add_test(NAME gh200_3d_smoke
         COMMAND ${Python3_EXECUTABLE}
           ${CMAKE_CURRENT_SOURCE_DIR}/examples/3d/run_example.py
           --executable $<TARGET_FILE:cell_gh200_3d>
           --output-dir ${CMAKE_CURRENT_BINARY_DIR}/gh200-3d-smoke-output)
       set_tests_properties(gh200_3d_smoke PROPERTIES TIMEOUT 300)
+      add_test(NAME gh200_3d_boundary_smoke
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/3d/run_boundary_smoke.py
+          --executable $<TARGET_FILE:cell_gh200_3d>)
+      set_tests_properties(gh200_3d_boundary_smoke PROPERTIES TIMEOUT 180)
+      add_test(NAME gh200_3d_promoted_regroup_smoke
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/3d/run_promoted_regroup_smoke.py
+          --executable $<TARGET_FILE:cell_gh200_3d>
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}/promoted-regroup-smoke-output)
+      set_tests_properties(gh200_3d_promoted_regroup_smoke PROPERTIES TIMEOUT 180)
     endif()
   endif()
+endif()
+
+if(PF_BUILD_PEER_PROBE)
+  find_package(Threads REQUIRED)
+  add_executable(pf_peer_probe tools/pf_peer_probe.cu)
+  target_include_directories(pf_peer_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/common
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(pf_peer_probe PRIVATE Threads::Threads)
+  target_compile_options(pf_peer_probe PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+  set_target_properties(pf_peer_probe PROPERTIES
+    CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+  pf_enable_warnings(pf_peer_probe)
 endif()
 
 install(TARGETS cell_gh200 RUNTIME DESTINATION bin)
@@ -445,6 +655,9 @@ if(TARGET boundary_export)
 endif()
 if(TARGET cell_gh200_3d)
   install(TARGETS cell_gh200_3d RUNTIME DESTINATION bin)
+endif()
+if(TARGET cell_gh200_3d_two_gpu)
+  install(TARGETS cell_gh200_3d_two_gpu RUNTIME DESTINATION bin)
 endif()
 if(TARGET palmieri_centres)
   install(TARGETS palmieri_centres RUNTIME DESTINATION bin)
@@ -457,6 +670,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tools/relaxed_2d_to_slab_centres.py)
 endif()
 install(PROGRAMS tools/render_pf3d_slab.py DESTINATION bin)
 install(PROGRAMS tools/velocity_moments.py DESTINATION bin)
+install(PROGRAMS tools/pf3d_boundary.py DESTINATION bin)
 install(FILES tools/pf3d_checkpoint_header.py DESTINATION bin)
 install(FILES
   README.md

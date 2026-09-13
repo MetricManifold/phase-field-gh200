@@ -4,6 +4,9 @@
 #include "pf3d/measure_shards.hpp"
 #include "pf3d/params.cuh"
 #include "pf3d/sim.cuh"
+#ifdef PF_TWO_GPU_SUBSTRATE
+#include "pf3d/two_gpu_sim.cuh"
+#endif
 
 #include <cerrno>
 #include <cmath>
@@ -64,13 +67,16 @@ void usage(const char* program) {
         "  --brick-edge <int>        aligned brick edge; 0 selects minimum   (0)\n"
         "  --scratch-slots <int>     in-place scratch bricks; 0 selects auto (0)\n"
         "  --device <int>            CUDA device                             (0)\n"
+#ifdef PF_TWO_GPU_SUBSTRATE
+        "  --peer-device <int>       second device; slab/channel throughput (1)\n"
+#endif
         "  --bench <int>             time this many steps, then exit\n"
         "  --bench-phases            with --bench: also report per-phase\n"
         "                            CUDA-event timings from a second window\n"
         "  --promoted-shards <int>   fast promoted-update CTAs per cell;\n"
         "                            0 selects the occupancy-derived count (0)\n"
         "  --fast-base-shards <int>  fast base-update CTAs per cell override;\n"
-        "                            0 keeps the standard policy         (0)\n"
+        "                            1..1024 pins the count; 0 keeps auto (0)\n"
         "  --measure-shards <int>    base measurement CTAs per cell; 0 keeps\n"
         "                            the standard at-most-four wave-fitting\n"
         "                            policy, -1 raises its cap to 64; 1..64 pins a\n"
@@ -83,6 +89,10 @@ void usage(const char* program) {
         "                            -1 selects the occupancy-derived count;\n"
         "                            sharded folds change reduction grouping\n"
         "                            and are not bitwise vs the 1-CTA fold (0)\n"
+        "  --allow-promoted-measure-regroup  resume-only opt-in to changing\n"
+        "                            --promoted-measure-shards (must be explicit);\n"
+        "                            preserves loaded fields and tumble state,\n"
+        "                            but permits floating-point regrouping\n"
         "  --strict                  enable scheduled invariant verification\n"
         "  --print-interval <int>    status cadence in steps; 0 disables     (100)\n"
         "\n"
@@ -90,6 +100,13 @@ void usage(const char* program) {
         "  --out <path>              plain-text 3-D trajectory\n"
         "  --trajectory-samples <n>  approximately evenly spaced frames     (100)\n"
         "  --trajectory-interval <n> exact frame cadence; overrides samples\n"
+        "\n"
+        "projected boundary output (off by default)\n"
+        "  --boundary-out <path>     new compact boundary file; never appended\n"
+        "  --boundary-interval <n>   required cadence in accepted steps\n"
+        "  --boundary-projection <maximum|basal> top-down silhouette or\n"
+        "                            substrate z=0 footprint       (maximum)\n"
+        "  --boundary-compression <none|zstd> optional zstd build     (none)\n"
         "\n"
         "checkpointing (current PF3D format)\n"
         "  -c, --checkpoint <path>   resume the complete stored state\n"
@@ -102,7 +119,8 @@ void usage(const char* program) {
         "fixed. An explicit --t-end may extend the run; device/memory choices,\n"
         "output/checkpoint schedules, and --strict may be changed. An explicit\n"
         "brick edge must match the checkpoint. Measurement groupings are\n"
-        "restored; an explicitly conflicting shard policy is rejected.\n"
+        "restored; an explicitly conflicting shard policy is rejected unless\n"
+        "promoted measurement regrouping is explicitly enabled above.\n"
         "For a slab, --rho targets rho_A when deriving integer Lx; the realized\n"
         "rho_A=N*pi*R^2/Lx^2 is reported. Nz is independent of rho_A,\n"
         "and V0 is the neutral 90-degree hemispherical cap 2*pi*R^3/3.\n"
@@ -214,6 +232,9 @@ void print_configuration(const SimParams3D& p, const RunOptions3D& options,
 struct ParsedCommand {
     SimParams3D params{};
     RunOptions3D options{};
+#ifdef PF_TWO_GPU_SUBSTRATE
+    int peer_device = 1;
+#endif
     std::string checkpoint_input;
     bool checkpoint_directory_supplied = false;
     bool checkpoint_schedule_supplied = false;
@@ -223,6 +244,7 @@ struct ParsedCommand {
     bool print_interval_supplied = false;
     bool trajectory_samples_supplied = false;
     bool trajectory_interval_supplied = false;
+    bool boundary_options_supplied = false;
     bool slab_height_supplied = false;
     int slab_height = 0;
     bool channel_height_supplied = false;
@@ -444,6 +466,15 @@ OptionStatus parse_execution_option(int argc, char** argv, int* index,
         }
         return OptionStatus::Accepted;
     }
+#ifdef PF_TWO_GPU_SUBSTRATE
+    if (std::strcmp(argument, "--peer-device") == 0) {
+        value = value_after(argc, argv, index, argument);
+        if (!value || !parse_integer(argument, value, 0, 63, &integer))
+            return OptionStatus::Error;
+        command->peer_device = static_cast<int>(integer);
+        return OptionStatus::Accepted;
+    }
+#endif
     if (std::strcmp(argument, "--memory-fraction") == 0) {
         value = value_after(argc, argv, index, argument);
         if (!value || !parse_double(argument, value, 0.50, 0.99,
@@ -484,6 +515,10 @@ OptionStatus parse_execution_option(int argc, char** argv, int* index,
         }
         options.promoted_measure_shards = static_cast<int>(integer);
         options.promoted_measure_shards_supplied = true;
+        return OptionStatus::Accepted;
+    }
+    if (std::strcmp(argument, "--allow-promoted-measure-regroup") == 0) {
+        options.allow_promoted_measure_regroup = true;
         return OptionStatus::Accepted;
     }
     if (std::strcmp(argument, "--measure-shards") == 0) {
@@ -546,6 +581,44 @@ OptionStatus parse_trajectory_option(int argc, char** argv, int* index,
     return OptionStatus::Unrecognized;
 }
 
+OptionStatus parse_boundary_option(int argc, char** argv, int* index,
+                                   const char* argument,
+                                   ParsedCommand* command) {
+    if (std::strcmp(argument, "--boundary-out") != 0 &&
+        std::strcmp(argument, "--boundary-interval") != 0 &&
+        std::strcmp(argument, "--boundary-projection") != 0 &&
+        std::strcmp(argument, "--boundary-compression") != 0)
+        return OptionStatus::Unrecognized;
+    command->boundary_options_supplied = true;
+    const char* value = value_after(argc, argv, index, argument);
+    if (!value) return OptionStatus::Error;
+    auto& options = command->options;
+    if (std::strcmp(argument, "--boundary-out") == 0) {
+        options.boundary_path = value;
+    } else if (std::strcmp(argument, "--boundary-interval") == 0) {
+        if (!parse_integer(argument, value, 1, 1000000000000LL,
+                           &options.boundary_interval))
+            return OptionStatus::Error;
+    } else if (std::strcmp(argument, "--boundary-projection") == 0) {
+        if (std::strcmp(value, "maximum") == 0)
+            options.boundary_projection = pf3d::boundary::Projection::Maximum;
+        else if (std::strcmp(value, "basal") == 0)
+            options.boundary_projection = pf3d::boundary::Projection::Basal;
+        else {
+            std::fprintf(stderr, "[3d] --boundary-projection expects maximum or basal\n");
+            return OptionStatus::Error;
+        }
+    } else {
+        if (std::strcmp(value, "none") == 0) options.boundary_compress = false;
+        else if (std::strcmp(value, "zstd") == 0) options.boundary_compress = true;
+        else {
+            std::fprintf(stderr, "[3d] --boundary-compression expects none or zstd\n");
+            return OptionStatus::Error;
+        }
+    }
+    return OptionStatus::Accepted;
+}
+
 OptionStatus parse_checkpoint_option(int argc, char** argv, int* index,
                                      const char* argument,
                                      ParsedCommand* command) {
@@ -596,6 +669,7 @@ CommandStatus parse_command_line(int argc, char** argv,
         parse_fresh_parameter_option,
         parse_execution_option,
         parse_trajectory_option,
+        parse_boundary_option,
         parse_checkpoint_option,
     };
 
@@ -621,6 +695,17 @@ CommandStatus parse_command_line(int argc, char** argv,
                          argument);
             return CommandStatus::UsageError;
         }
+    }
+    if (command->boundary_options_supplied &&
+        (command->options.boundary_path.empty() ||
+         command->options.boundary_interval <= 0)) {
+        std::fprintf(stderr,
+            "[3d] boundary output requires --boundary-out and --boundary-interval\n");
+        return CommandStatus::UsageError;
+    }
+    if (command->boundary_options_supplied && command->options.bench_steps > 0) {
+        std::fprintf(stderr, "[3d] boundary output cannot be combined with --bench\n");
+        return CommandStatus::UsageError;
     }
     return CommandStatus::Ready;
 }
@@ -755,7 +840,8 @@ CommandStatus resolve_resume_contract(ParsedCommand* command,
         pf3d::resolve_promoted_measure_resume(
             prepared->checkpoint.promoted_measure_reduction,
             command->options.promoted_measure_shards_supplied,
-            command->options.promoted_measure_shards, &reduction);
+            command->options.promoted_measure_shards, &reduction,
+            command->options.allow_promoted_measure_regroup);
     if (reduction_result != pf3d::ReductionResumeResult::Ok) {
         if (reduction_result == pf3d::ReductionResumeResult::Mismatch) {
             std::fprintf(stderr,
@@ -763,6 +849,10 @@ CommandStatus resolve_resume_contract(ParsedCommand* command,
                 "requested %d would change the numerical reduction grouping\n",
                 prepared->checkpoint.promoted_measure_reduction.policy,
                 command->options.promoted_measure_shards);
+        } else if (reduction_result == pf3d::ReductionResumeResult::InvalidRequest) {
+            std::fprintf(stderr,
+                "[3d] promoted measurement regrouping requires an explicit "
+                "--promoted-measure-shards policy in -1..64\n");
         } else {
             std::fprintf(stderr,
                 "[3d] checkpoint has an invalid promoted-measurement "
@@ -795,6 +885,14 @@ CommandStatus resolve_resume_contract(ParsedCommand* command,
 
 CommandStatus prepare_run(ParsedCommand* command, PreparedRun* prepared) {
     prepared->resumed = !command->checkpoint_input.empty();
+    if (command->options.allow_promoted_measure_regroup &&
+        (!prepared->resumed ||
+         !command->options.promoted_measure_shards_supplied)) {
+        std::fprintf(stderr,
+            "[3d] --allow-promoted-measure-regroup requires --checkpoint "
+            "and explicit --promoted-measure-shards\n");
+        return CommandStatus::UsageError;
+    }
     if (prepared->resumed &&
         (command->fresh_parameter_supplied ||
          command->initial_centres_supplied)) {
@@ -819,6 +917,12 @@ CommandStatus prepare_run(ParsedCommand* command, PreparedRun* prepared) {
     }
 
     const char* validation_error = nullptr;
+    if (!command->options.boundary_path.empty() &&
+        command->options.boundary_projection == pf3d::boundary::Projection::Basal &&
+        !prepared->effective.substrate_slab()) {
+        std::fprintf(stderr, "[3d] basal boundary output requires --geometry slab\n");
+        return CommandStatus::UsageError;
+    }
     if (!pf3d::validate(prepared->effective, &validation_error)) {
         std::fprintf(stderr, "[3d] invalid parameters: %s\n",
                      validation_error ? validation_error : "unknown reason");
@@ -853,7 +957,11 @@ int launch_simulation(const ParsedCommand& command,
     print_configuration(prepared.effective, command.options,
                         prepared.effective_brick, prepared.resumed);
 
+#ifdef PF_TWO_GPU_SUBSTRATE
+    pf3d::TwoGpuSim3D simulation(command.peer_device);
+#else
     pf3d::Sim3D simulation;
+#endif
     const bool initialized = prepared.resumed
         ? simulation.init_checkpoint(
               prepared.checkpoint, command.checkpoint_input, command.options,

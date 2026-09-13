@@ -1,4 +1,5 @@
 #include "../../include/pf3d/kernels.cuh"
+#include "../../include/pf3d/bounded_z_map.hpp"
 
 #include "device_common.cuh"
 
@@ -20,6 +21,16 @@ using Reduction3D = MomentPartial3D;
 constexpr bool recognized_boundary(const SLayout3D& layout) {
     return layout.periodic_xyz() || layout.substrate_slab() ||
            layout.hard_wall_channel();
+}
+
+// Pointer-backed cells may have different cube edges in the same launch.
+// The host validates the maximum against the domain before enqueueing work.
+__device__ __forceinline__ int promoted_cell_edge(
+    const CellState3D& cell, int base_edge, int maximum_edge) {
+    const std::uint32_t edge = cell.storage_edge;
+    return edge > static_cast<std::uint32_t>(base_edge) &&
+           edge <= static_cast<std::uint32_t>(maximum_edge) &&
+           edge % kBrickAlignment == 0u ? static_cast<int>(edge) : 0;
 }
 
 // The resolved wall contributes (kappa_w/kappa) psi_w(z)^2 to the field that
@@ -107,6 +118,7 @@ __device__ __forceinline__ bool load_halo(const float* tile, int B,
                                            int x0, int y0, int z0,
                                            const SLayout3D& layout,
                                            std::int64_t origin_z,
+                                           const CellFieldStorage3D& storage,
                                            float* shared_phi) {
     bool any_nonzero = false;
     for (int q = static_cast<int>(threadIdx.x); q < kHaloVoxels;
@@ -122,7 +134,7 @@ __device__ __forceinline__ bool load_halo(const float* tile, int B,
             (static_cast<unsigned>(x) < static_cast<unsigned>(B) &&
              static_cast<unsigned>(y) < static_cast<unsigned>(B) &&
              phase_fetch_local_z(layout, origin_z, z, B, &source_z))
-                ? tile[local_index(x, y, source_z, B)] : 0.0f;
+                ? tile[storage.index(x, y, source_z, B, origin_z)] : 0.0f;
         shared_phi[q] = value;
         any_nonzero = any_nonzero || value != 0.0f;
     }
@@ -170,6 +182,61 @@ __device__ __forceinline__ void stencil27(const float* shared_phi,
                     - shared_phi[halo_index(hx, hy, hz - 1)]);
 }
 
+__device__ __forceinline__ void load_stencil_plane(
+    const float* shared_phi, int ix, int iy, int hz, float* plane) {
+#pragma unroll
+    for (int y = 0; y < 3; ++y)
+#pragma unroll
+        for (int x = 0; x < 3; ++x)
+            plane[y * 3 + x] = shared_phi[halo_index(ix + x, iy + y, hz)];
+}
+
+struct StencilValues3D {
+    float centre, lap, gx, gy, gz;
+};
+
+template <int ZDistance, typename Fetch>
+__device__ __forceinline__ float accumulate_stencil_plane(
+    float weighted, const Fetch& fetch) {
+#pragma unroll
+    for (int y = 0; y < 3; ++y) {
+#pragma unroll
+        for (int x = 0; x < 3; ++x) {
+            const int distance = ZDistance + (x != 1) + (y != 1);
+            if (distance == 0) continue;
+            const int weight = distance == 1 ? kLapFaceW
+                             : distance == 2 ? kLapEdgeW : kLapCornerW;
+            weighted += static_cast<float>(weight) * fetch(x, y);
+        }
+    }
+    return weighted;
+}
+
+// Consume z-1 before replacing it with z+1. Two retained planes suffice,
+// and the summation order stays z, then y, then x, as in stencil27.
+__device__ __forceinline__ StencilValues3D advance_stencil_plane(
+    const float* shared_phi, int ix, int iy, int iz,
+    float* below, const float* middle) {
+    const float lower_centre = below[4];
+    StencilValues3D result{};
+    result.centre = middle[4];
+    float weighted = static_cast<float>(kLapCentreW) * result.centre;
+    weighted = accumulate_stencil_plane<1>(weighted,
+        [&](int x, int y) { return below[y * 3 + x]; });
+    weighted = accumulate_stencil_plane<0>(weighted,
+        [&](int x, int y) { return middle[y * 3 + x]; });
+    weighted = accumulate_stencil_plane<1>(weighted, [&](int x, int y) {
+        const float value = shared_phi[halo_index(ix + x, iy + y, iz + 2)];
+        below[y * 3 + x] = value;
+        return value;
+    });
+    result.lap = weighted * static_cast<float>(1.0 / kLapDenom);
+    result.gx = 0.5f * (middle[5] - middle[3]);
+    result.gy = 0.5f * (middle[7] - middle[1]);
+    result.gz = 0.5f * (below[4] - lower_centre);
+    return result;
+}
+
 // The measurement and surface passes use only the centred gradients, so the
 // Laplacian accumulation of stencil27 is dead work there.  These expressions
 // are verbatim the gradient tail of stencil27.
@@ -188,11 +255,12 @@ __device__ __forceinline__ void gradient3(const float* shared_phi,
 
 // Two shared-memory halo slabs overlap the next tile's asynchronous load with
 // the current stencil. They reproduce the synchronous loader's values exactly.
+template <typename FetchZ>
 __device__ __forceinline__ void prefetch_halo(const float* tile, int B,
                                                int tile_index, int tiles_x,
                                                int tiles_y,
-                                               const SLayout3D& layout,
-                                               std::int64_t origin_z,
+                                               const FetchZ& fetch_z,
+                                               int storage_z_offset,
                                                float* shared_buf) {
     const int tx = tile_index % tiles_x;
     const int ty = (tile_index / tiles_x) % tiles_y;
@@ -200,26 +268,52 @@ __device__ __forceinline__ void prefetch_halo(const float* tile, int B,
     const int x0 = tx * kBrickX - 1;
     const int y0 = ty * kBrickY - 1;
     const int z0 = tz * kBrickZ - 1;
+    const int first = static_cast<int>(threadIdx.x);
+    int hx = first % kHaloX;
+    int hy = (first / kHaloX) % kHaloY;
+    int hz = first / (kHaloX * kHaloY);
+    // Advance the same strided voxel sequence using row/plane carries.
+    constexpr int step_x = kThreads3D % kHaloX;
+    constexpr int step_y = (kThreads3D / kHaloX) % kHaloY;
+    constexpr int step_z = kThreads3D / (kHaloX * kHaloY);
     for (int q = static_cast<int>(threadIdx.x); q < kHaloVoxels;
          q += kThreads3D) {
-        const int hx = q % kHaloX;
-        const int hy = (q / kHaloX) % kHaloY;
-        const int hz = q / (kHaloX * kHaloY);
         const int x = x0 + hx;
         const int y = y0 + hy;
         const int z = z0 + hz;
         int source_z = 0;
         if (static_cast<unsigned>(x) < static_cast<unsigned>(B) &&
             static_cast<unsigned>(y) < static_cast<unsigned>(B) &&
-            phase_fetch_local_z(layout, origin_z, z, B, &source_z)) {
+            fetch_z(z, &source_z)) {
             __pipeline_memcpy_async(&shared_buf[q],
-                                    &tile[local_index(x, y, source_z, B)],
+                                    &tile[local_index(x, y,
+                                           source_z + storage_z_offset, B)],
                                     sizeof(float));
         } else {
             shared_buf[q] = 0.0f;
         }
+        hx += step_x;
+        hy += step_y;
+        hz += step_z;
+        if (hx >= kHaloX) { hx -= kHaloX; ++hy; }
+        if (hy >= kHaloY) { hy -= kHaloY; ++hz; }
     }
     __pipeline_commit();
+}
+
+__device__ __forceinline__ void prefetch_halo(const float* tile, int B,
+                                               int tile_index, int tiles_x,
+                                               int tiles_y,
+                                               const SLayout3D& layout,
+                                               std::int64_t origin_z,
+                                               const CellFieldStorage3D& storage,
+                                               float* shared_buf) {
+    const auto fetch_z = [&](int z, int* source_z) {
+        return phase_fetch_local_z(layout, origin_z, z, B, source_z);
+    };
+    const int storage_z_offset = storage.compact(B) ? static_cast<int>(origin_z) : 0;
+    prefetch_halo(tile, B, tile_index, tiles_x, tiles_y, fetch_z,
+                  storage_z_offset, shared_buf);
 }
 
 // The phase equation leaves an all-zero halo exactly zero, so skipping such a
@@ -235,7 +329,7 @@ __device__ __forceinline__ bool halo_any_nonzero(const float* shared_buf) {
 }
 
 // Bounded-z bricks can extend beyond the allocated z array. Planes wholly
-// outside that array hold exact zeros,
+// outside that array are exact or implicit zeros,
 // contribute nothing to any accumulator, write nothing, and raise nothing,
 // so the walk can omit their tiles before staging halos.  Every tile with at
 // least one allocated plane is kept, which preserves the reflected z=-1
@@ -383,7 +477,7 @@ __device__ void process_update_cell(int n, const UpdateArgs3D& args,
                                     int B, float* halo_pair,
                                     Reduction3D* warp_values,
                                     int* abort_flag) {
-    const std::size_t words = cell_words(B);
+    const std::size_t words = stored_cell_words(B, args.storage);
     CellState3D* state = &args.cells[n];
 
     // Measurement completes before this kernel in the same stream.  If it
@@ -413,8 +507,11 @@ __device__ void process_update_cell(int n, const UpdateArgs3D& args,
                 const int x = static_cast<int>(q % static_cast<std::size_t>(B));
                 const int y = static_cast<int>((q / static_cast<std::size_t>(B))
                                               % static_cast<std::size_t>(B));
-                const int z = static_cast<int>(
+                const int stored_z = static_cast<int>(
                     q / (static_cast<std::size_t>(B) * B));
+                int z = 0;
+                if (!logical_z_from_stored(stored_z, B, state->origin_z,
+                                           args.storage, &z)) continue;
                 int wz = 0;
                 if (!aggregate_z(args.layout, state->origin_z, z, &wz))
                     continue;
@@ -490,14 +587,14 @@ __device__ void process_update_cell(int n, const UpdateArgs3D& args,
     int parity = 0;
     if (tile_begin < tile_end)
         prefetch_halo(source, B, tile_begin, tiles_x, tiles_y, args.layout,
-                      state->origin_z, halo0);
+                      state->origin_z, args.storage, halo0);
     // Preserve x-fastest tile order while streaming the next halo during the
     // current tile's stencil work.
     for (int tile = tile_begin; tile < tile_end; ++tile) {
         const bool more = tile + 1 < tile_end;
         if (more)
             prefetch_halo(source, B, tile + 1, tiles_x, tiles_y,
-                          args.layout, state->origin_z,
+                          args.layout, state->origin_z, args.storage,
                           parity == 0 ? halo1 : halo0);
         __pipeline_wait_prior(more ? 1 : 0);
         float* const shared_phi = parity == 0 ? halo0 : halo1;
@@ -575,7 +672,7 @@ __device__ void process_update_cell(int n, const UpdateArgs3D& args,
                                    FLAG3D_DESTINATION_CLIP);
                     continue;
                 }
-                destination[local_index(dx, dy, dz, B)] = next;
+                destination[field_index_at_world_z(dx, dy, dz, wz, B, args.storage)] = next;
 
                 if (args.S_out != nullptr) {
                     // (new_origin + destination) equals (old_origin + source).
@@ -623,7 +720,7 @@ __device__ void process_update_cell(int n, const UpdateArgs3D& args,
             for (int y0 = 0; y0 < B; y0 += kBrickY) {
                 for (int x0 = 0; x0 < B; x0 += kBrickX) {
                     if (!load_halo(destination, B, x0, y0, z0, args.layout,
-                                   destination_origin_z, halo0))
+                                   destination_origin_z, args.storage, halo0))
                         continue;
                     for (int q = static_cast<int>(threadIdx.x);
                          q < kBrickVoxels; q += kThreads3D) {
@@ -671,7 +768,29 @@ __device__ void process_update_cell(int n, const UpdateArgs3D& args,
     __syncthreads();
 }
 
-template <bool CollectMoments, bool WallCoupling>
+template <UpdateTilePass3D Pass>
+__device__ __forceinline__ int next_update_tile(
+    int tile, int tile_end, int shards_per_cell, int tiles_x,
+    int tiles_per_plane, int B, const UpdateArgs3D& args,
+    int origin_y, std::int64_t origin_z) {
+    if constexpr (Pass != UpdateTilePass3D::All) {
+        for (; tile < tile_end; tile += shards_per_cell) {
+            const int tz = tile / tiles_per_plane;
+            const int ty = (tile - tz * tiles_per_plane) / tiles_x;
+            const int y0 = ty * kBrickY;
+            const int z0 = tz * kBrickZ;
+            const bool boundary = tile_intersects_exchange_canonical(
+                args.exchange_region, args.layout.ny,
+                origin_y, origin_z, y0, z0,
+                min(kBrickY, B - y0), min(kBrickZ, B - z0));
+            if (boundary == (Pass == UpdateTilePass3D::Boundary)) break;
+        }
+    }
+    return tile;
+}
+
+template <bool CollectMoments, bool WallCoupling,
+          UpdateTilePass3D Pass = UpdateTilePass3D::All>
 __device__ void process_update_shard(int n, int shard, int shards_per_cell,
                                      const UpdateArgs3D& args,
                                      const float* source, float* destination,
@@ -711,6 +830,20 @@ __device__ void process_update_shard(int n, int shard, int shards_per_cell,
         if (!destination_origin_valid) return;
         const int origin_x = wrap_origin(state->origin_x, args.layout.nx);
         const int origin_y = wrap_origin(state->origin_y, args.layout.ny);
+        // The source origin stays fixed until every update shard completes.
+        const std::int64_t origin_z = state->origin_z;
+        const bool bounded_z = WallCoupling || Pass != UpdateTilePass3D::All
+                            || args.layout.bounded_z();
+        const auto z_map = bounded_z
+            ? BoundedZMap::make(origin_z, B, args.layout.nz,
+                               args.layout.hard_wall_channel())
+            : BoundedZMap{};
+        const auto fetch_z = [&](int z, int* source_z) {
+            return bounded_z ? z_map.fetch(z, source_z)
+                : phase_fetch_local_z(args.layout, origin_z, z, B, source_z);
+        };
+        const int storage_z_offset = args.storage.compact(B)
+            ? static_cast<int>(origin_z) : 0;
         // Constant for the whole brick; see process_update_cell.
         const float gamma = state->gamma;
         const float velocity_x = state->velocity_x;
@@ -737,20 +870,26 @@ __device__ void process_update_shard(int n, int shard, int shards_per_cell,
         // recentering is a translation, so different source tiles also have
         // disjoint outputs.
         const int begin_remainder = tile_begin % shards_per_cell;
-        const int first_tile = tile_begin
-            + (shard - begin_remainder + shards_per_cell) % shards_per_cell;
+        const int first_tile = next_update_tile<Pass>(
+            tile_begin
+                + (shard - begin_remainder + shards_per_cell) % shards_per_cell,
+            tile_end, shards_per_cell, tiles_x, tiles_per_plane, B,
+            args, origin_y, state->origin_z);
         float* const halo0 = halo_pair;
         float* const halo1 = halo_pair + kHaloVoxels;
         int parity = 0;
         if (first_tile < tile_end)
             prefetch_halo(source, B, first_tile, tiles_x, tiles_y,
-                          args.layout, state->origin_z, halo0);
-        for (int tile = first_tile; tile < tile_end;
-             tile += shards_per_cell) {
-            const bool more = tile + shards_per_cell < tile_end;
+                          fetch_z, storage_z_offset, halo0);
+        int next_tile = first_tile;
+        for (int tile = first_tile; tile < tile_end; tile = next_tile) {
+            next_tile = next_update_tile<Pass>(
+                tile + shards_per_cell, tile_end, shards_per_cell,
+                tiles_x, tiles_per_plane, B, args, origin_y, state->origin_z);
+            const bool more = next_tile < tile_end;
             if (more)
-                prefetch_halo(source, B, tile + shards_per_cell,
-                              tiles_x, tiles_y, args.layout, state->origin_z,
+                prefetch_halo(source, B, next_tile,
+                              tiles_x, tiles_y, fetch_z, storage_z_offset,
                               parity == 0 ? halo1 : halo0);
             __pipeline_wait_prior(more ? 1 : 0);
             float* const shared_phi = parity == 0 ? halo0 : halo1;
@@ -767,29 +906,29 @@ __device__ void process_update_shard(int n, int shard, int shards_per_cell,
             const int y0 = ty * kBrickY;
             const int z0 = tz * kBrickZ;
 
-            for (int q = static_cast<int>(threadIdx.x); q < kBrickVoxels;
-                 q += kThreads3D) {
-                const int ix = q % kBrickX;
-                const int iy = (q / kBrickX) % kBrickY;
-                const int iz = q / (kBrickX * kBrickY);
+            const auto update_voxel = [&](int ix, int iy, int iz,
+                                          StencilValues3D values) {
                 const int x = x0 + ix, y = y0 + iy, z = z0 + iz;
-                if (x >= B || y >= B || z >= B) continue;
+                if (x >= B || y >= B || z >= B) return;
                 int wz = 0;
-                if (!aggregate_z(args.layout, state->origin_z, z, &wz))
-                    continue;
+                const bool mapped = bounded_z ? z_map.aggregate(z, &wz)
+                    : aggregate_z(args.layout, origin_z, z, &wz);
+                if (!mapped) return;
 
                 const int hi = halo_index(ix + 1, iy + 1, iz + 1);
-                const float centre = shared_phi[hi];
+                const float centre = CollectMoments ? shared_phi[hi] : values.centre;
                 if (!isfinite(centre)) {
                     raise_flag(state, args.global_flags, FLAG3D_NONFINITE);
-                    continue;
+                    return;
                 }
-                float lap, gx, gy, gz;
-                stencil27(shared_phi, ix + 1, iy + 1, iz + 1,
-                          &lap, &gx, &gy, &gz);
+                float lap = values.lap, gx = values.gx;
+                float gy = values.gy, gz = values.gz;
+                if constexpr (CollectMoments)
+                    stencil27(shared_phi, ix + 1, iy + 1, iz + 1,
+                              &lap, &gx, &gy, &gz);
                 if (centre == 0.0f && lap == 0.0f && gx == 0.0f &&
                     gy == 0.0f && gz == 0.0f)
-                    continue;
+                    return;
 
                 const int wx = wrap_offset(origin_x, x, args.layout.nx);
                 const int wy = wrap_offset(origin_y, y, args.layout.ny);
@@ -809,13 +948,13 @@ __device__ void process_update_shard(int n, int shard, int shards_per_cell,
                 const float next = centre + args.dt * rhs;
                 if (!isfinite(next)) {
                     raise_flag(state, args.global_flags, FLAG3D_NONFINITE);
-                    continue;
+                    return;
                 }
                 if (args.layout.substrate_slab() &&
                     wz == args.layout.nz - 1 && fabsf(next) > kSupportEps) {
                     raise_flag(state, args.global_flags,
                                FLAG3D_SLAB_TOP_CONTACT);
-                    continue;
+                    return;
                 }
 
                 const int dx = x - shift_x;
@@ -827,9 +966,9 @@ __device__ void process_update_shard(int n, int shard, int shards_per_cell,
                     if (fabsf(next) > kSupportEps)
                         raise_flag(state, args.global_flags,
                                    FLAG3D_DESTINATION_CLIP);
-                    continue;
+                    return;
                 }
-                destination[local_index(dx, dy, dz, B)] = next;
+                destination[field_index_at_world_z(dx, dy, dz, wz, B, args.storage)] = next;
 
                 if (args.S_out != nullptr) {
                     // Integer Q5.27 additions are exact and order-independent;
@@ -857,6 +996,35 @@ __device__ void process_update_shard(int n, int shard, int shards_per_cell,
                         local.hi_z = max(local.hi_z, dz);
                     }
                 }
+            };
+            if constexpr (CollectMoments) {
+                for (int q = static_cast<int>(threadIdx.x); q < kBrickVoxels;
+                     q += kThreads3D) {
+                    const int ix = q % kBrickX;
+                    const int iy = (q / kBrickX) % kBrickY;
+                    const int iz = q / (kBrickX * kBrickY);
+                    update_voxel(ix, iy, iz, {});
+                }
+            } else {
+                // A warp retains its x-row while advancing through z. Each
+                // stencil reuses two XY planes and loads only the next plane.
+                const int ix = static_cast<int>(threadIdx.x) % kBrickX;
+                for (int iy = static_cast<int>(threadIdx.x) / kBrickX;
+                     iy < kBrickY; iy += kThreads3D / kBrickX) {
+                    float p0[9], p1[9];
+                    load_stencil_plane(shared_phi, ix, iy, 0, p0);
+                    load_stencil_plane(shared_phi, ix, iy, 1, p1);
+                    const auto advance = [&](float* below,
+                                              const float* middle, int iz) {
+                        const auto values = advance_stencil_plane(
+                            shared_phi, ix, iy, iz, below, middle);
+                        update_voxel(ix, iy, iz, values);
+                    };
+                    for (int iz = 0; iz < kBrickZ; iz += 2) {
+                        advance(p0, p1, iz);
+                        if (iz + 1 < kBrickZ) advance(p1, p0, iz + 1);
+                    }
+                }
             }
             __syncthreads();
             parity = 1 - parity;
@@ -880,7 +1048,7 @@ __global__ void k_initialize_spheres(InitArgs3D args) {
     const int n = static_cast<int>(blockIdx.x);
     if (n >= args.N) return;
     const int B = args.B;
-    const std::size_t words = cell_words(B);
+    const std::size_t words = stored_cell_words(B, args.storage);
     CellState3D* state = &args.cells[n];
     const Vec3 centre = args.centres[n];
 
@@ -908,7 +1076,13 @@ __global__ void k_initialize_spheres(InitArgs3D args) {
         const int x = static_cast<int>(q % static_cast<std::size_t>(B));
         const int y = static_cast<int>((q / static_cast<std::size_t>(B))
                                       % static_cast<std::size_t>(B));
-        const int z = static_cast<int>(q / (static_cast<std::size_t>(B) * B));
+        const int stored_z = static_cast<int>(q / (static_cast<std::size_t>(B) * B));
+        int z = 0;
+        if (!logical_z_from_stored(stored_z, B, state->origin_z, args.storage, &z)) {
+            even[q] = 0.0f;
+            if (odd != nullptr) odd[q] = 0.0f;
+            continue;
+        }
         int physical_z = 0;
         const bool in_domain = aggregate_z(
             args.layout, state->origin_z, z, &physical_z);
@@ -931,11 +1105,29 @@ __global__ void k_clear_u32(std::uint32_t* data, std::size_t words) {
         data[q] = 0u;
 }
 
+__global__ void k_clear_selected_base_out(UpdateArgs3D args,
+                                          int blocks_per_cell) {
+    const int slot = static_cast<int>(blockIdx.x) / blocks_per_cell;
+    const int part = static_cast<int>(blockIdx.x) % blocks_per_cell;
+    if (slot >= args.selection.selected_count(args.N)) return;
+    const int n = args.selection.cell_index(slot);
+    if (cell_is_promoted(args.cells[n], args.B)) return;
+    const std::size_t words = stored_cell_words(args.B, args.storage);
+    float* out = args.phi_out + static_cast<std::size_t>(n) * words;
+    const std::size_t stride =
+        static_cast<std::size_t>(blocks_per_cell) * blockDim.x;
+    for (std::size_t q = static_cast<std::size_t>(part) * blockDim.x
+                       + threadIdx.x; q < words; q += stride)
+        out[q] = 0.0f;
+}
+
 __global__ void k_scatter_current(ScatterArgs3D args) {
-    const int n = static_cast<int>(blockIdx.x);
-    if (n >= args.N || cell_is_promoted(args.cells[n], args.B)) return;
+    const int slot = static_cast<int>(blockIdx.x);
+    if (slot >= args.selection.selected_count(args.N)) return;
+    const int n = args.selection.cell_index(slot);
+    if (cell_is_promoted(args.cells[n], args.B)) return;
     const int B = args.B;
-    const std::size_t words = cell_words(B);
+    const std::size_t words = stored_cell_words(B, args.storage);
     CellState3D* state = &args.cells[n];
     const float* tile = args.phi + static_cast<std::size_t>(n) * words;
     const int ox = wrap_origin(state->origin_x, args.layout.nx);
@@ -951,11 +1143,10 @@ __global__ void k_scatter_current(ScatterArgs3D args) {
     for (int row = warp; row < rows; row += warps) {
         const int z = row / B;
         const int y = row - z * B;
-        const float* grow = tile + static_cast<std::size_t>(row)
-                                 * static_cast<std::size_t>(B);
         const int wy = wrap_offset(oy, y, args.layout.ny);
         int wz = 0;
         if (!aggregate_z(args.layout, state->origin_z, z, &wz)) continue;
+        const float* grow = tile + field_index_at_world_z(0, y, z, wz, B, args.storage);
         const std::size_t row_base = s_index(args.layout, 0, wy, wz);
         for (int x = lane; x < B; x += 32) {
             const float value = grow[x];
@@ -977,10 +1168,9 @@ __global__ void k_scatter_promoted(ScatterArgs3D args,
     const int slot = static_cast<int>(blockIdx.x);
     if (slot >= promoted_count) return;
     const int n = promoted_ids[slot];
-    if (n < 0 || n >= args.N || promoted_phi[n] == nullptr ||
-        cell_support_edge(args.cells[n], args.B) != promoted_edge)
-        return;
-    const int B = promoted_edge;
+    if (n < 0 || n >= args.N || promoted_phi[n] == nullptr) return;
+    const int B = promoted_cell_edge(args.cells[n], args.B, promoted_edge);
+    if (B == 0) return;
     CellState3D* state = &args.cells[n];
     const float* tile = promoted_phi[n];
     const int ox = wrap_origin(state->origin_x, args.layout.nx);
@@ -992,10 +1182,10 @@ __global__ void k_scatter_promoted(ScatterArgs3D args,
     for (int row = warp; row < rows; row += warps) {
         const int z = row / B;
         const int y = row - z * B;
-        const float* grow = tile + static_cast<std::size_t>(row) * B;
         const int wy = wrap_offset(oy, y, args.layout.ny);
         int wz = 0;
         if (!aggregate_z(args.layout, state->origin_z, z, &wz)) continue;
+        const float* grow = tile + field_index_at_world_z(0, y, z, wz, B, args.storage);
         const std::size_t row_base = s_index(args.layout, 0, wy, wz);
         for (int x = lane; x < B; x += 32) {
             const float value = grow[x];
@@ -1010,6 +1200,50 @@ __global__ void k_scatter_promoted(ScatterArgs3D args,
     }
 }
 
+__global__ void k_check_promoted_crops(
+    float* const* phi, const CellState3D* cells, const int* candidate_edges,
+    std::uint32_t* rejected, int N, int base_edge, CellFieldStorage3D storage) {
+    const int n = static_cast<int>(blockIdx.x);
+    if (n >= N) return;
+    const int target = candidate_edges[n];
+    if (target == 0) return;
+    constexpr int kCropGuard = 8;
+    const int B = promoted_cell_edge(cells[n], base_edge, INT_MAX);
+    const bool valid = B > 0 && target >= base_edge && target < B &&
+        target > 2 * kCropGuard && target % kBrickAlignment == 0 &&
+        phi[n] != nullptr &&
+        static_cast<std::size_t>(B) <=
+            SIZE_MAX / static_cast<std::size_t>(B) /
+            static_cast<std::size_t>(B) / sizeof(float);
+    if (!valid) {
+        if (threadIdx.x == 0) atomicOr(rejected + n, 1u);
+        return;
+    }
+
+    const int offset = (B - target) / 2;
+    const int lo = offset + kCropGuard;
+    const int hi = offset + target - kCropGuard;
+    const std::size_t words = cell_words(B);
+    bool reject = false;
+    for (std::size_t q = threadIdx.x; q < words; q += blockDim.x) {
+        const float value = logical_field_value(phi[n], q, B, cells[n].origin_z, storage);
+        const int x = static_cast<int>(q % B);
+        const int y = static_cast<int>((q / B) % B);
+        const int z = static_cast<int>(q / (static_cast<std::size_t>(B) * B));
+        const bool outside = x < lo || x >= hi || y < lo || y >= hi ||
+                             z < lo || z >= hi;
+        // Inspect the logical cube; omitted domain-exterior planes are zero.
+        // Exact zeros also protect eight retained planes at each crop face.
+        // A support threshold cannot justify discarding nonzero field values.
+        if (!isfinite(value) || (outside && value != 0.0f)) {
+            reject = true;
+            break;
+        }
+    }
+    const int any_rejected = __syncthreads_or(reject ? 1 : 0);
+    if (threadIdx.x == 0 && any_rejected) atomicOr(rejected + n, 1u);
+}
+
 template <bool WallCoupling>
 __device__ void measure_one_cell(const MeasureArgs3D& args, int n, int B,
                                  const float* tile, float* halo_pair,
@@ -1017,6 +1251,20 @@ __device__ void measure_one_cell(const MeasureArgs3D& args, int n, int B,
     CellState3D* state = &args.cells[n];
     const int ox = wrap_origin(state->origin_x, args.layout.nx);
     const int oy = wrap_origin(state->origin_y, args.layout.ny);
+
+    // The origin is fixed throughout this measurement, including halo staging.
+    const std::int64_t origin_z = state->origin_z;
+    const bool bounded_z = args.layout.bounded_z();
+    const auto z_map = bounded_z
+        ? BoundedZMap::make(origin_z, B, args.layout.nz,
+                           args.layout.hard_wall_channel())
+        : BoundedZMap{};
+    const auto fetch_z = [&](int z, int* source_z) {
+        return bounded_z ? z_map.fetch(z, source_z)
+            : phase_fetch_local_z(args.layout, origin_z, z, B, source_z);
+    };
+    const int storage_z_offset = args.storage.compact(B)
+        ? static_cast<int>(origin_z) : 0;
 
     Reduction3D local{};
     local.lo_x = local.lo_y = local.lo_z = B;
@@ -1026,7 +1274,7 @@ __device__ void measure_one_cell(const MeasureArgs3D& args, int n, int B,
     const int tiles_y = (B + kBrickY - 1) / kBrickY;
     const int tiles_z = (B + kBrickZ - 1) / kBrickZ;
     int tz_begin = 0, tz_end = tiles_z;
-    live_tile_z_range(args.layout, state->origin_z, B, tiles_z,
+    live_tile_z_range(args.layout, origin_z, B, tiles_z,
                       &tz_begin, &tz_end);
     const int tiles_per_plane = tiles_x * tiles_y;
     const int tile_begin = tz_begin * tiles_per_plane;
@@ -1035,14 +1283,14 @@ __device__ void measure_one_cell(const MeasureArgs3D& args, int n, int B,
     float* const halo1 = halo_pair + kHaloVoxels;
     int parity = 0;
     if (tile_begin < tile_end)
-        prefetch_halo(tile, B, tile_begin, tiles_x, tiles_y, args.layout,
-                      state->origin_z, halo0);
+        prefetch_halo(tile, B, tile_begin, tiles_x, tiles_y, fetch_z,
+                      storage_z_offset, halo0);
     // X-fastest tile order fixes each thread's voxel accumulation sequence.
     for (int t = tile_begin; t < tile_end; ++t) {
         const bool more = t + 1 < tile_end;
         if (more)
             prefetch_halo(tile, B, t + 1, tiles_x, tiles_y,
-                          args.layout, state->origin_z,
+                          fetch_z, storage_z_offset,
                           parity == 0 ? halo1 : halo0);
         __pipeline_wait_prior(more ? 1 : 0);
         float* const shared_phi = parity == 0 ? halo0 : halo1;
@@ -1061,7 +1309,9 @@ __device__ void measure_one_cell(const MeasureArgs3D& args, int n, int B,
                 const int x = x0 + ix, y = y0 + iy, z = z0 + iz;
                 if (x >= B || y >= B || z >= B) continue;
                 int wz = 0;
-                if (!aggregate_z(args.layout, state->origin_z, z, &wz))
+                const bool mapped = bounded_z ? z_map.aggregate(z, &wz)
+                    : aggregate_z(args.layout, origin_z, z, &wz);
+                if (!mapped)
                     continue;
                 const float centre = shared_phi[halo_index(ix + 1, iy + 1,
                                                            iz + 1)];
@@ -1124,9 +1374,11 @@ __global__ __launch_bounds__(kThreads3D, 3)
 void k_measure_cells_impl(MeasureArgs3D args) {
     extern __shared__ float halo_pair[];
     __shared__ Reduction3D warp_values[kWarps3D];
-    const int n = static_cast<int>(blockIdx.x);
-    if (n >= args.N || cell_is_promoted(args.cells[n], args.B)) return;
-    const std::size_t words = cell_words(args.B);
+    const int slot = static_cast<int>(blockIdx.x);
+    if (slot >= args.selection.selected_count(args.N)) return;
+    const int n = args.selection.cell_index(slot);
+    if (cell_is_promoted(args.cells[n], args.B)) return;
+    const std::size_t words = stored_cell_words(args.B, args.storage);
     const float* tile = args.phi + static_cast<std::size_t>(n) * words;
     measure_one_cell<WallCoupling>(args, n, args.B, tile, halo_pair,
                                    warp_values);
@@ -1143,10 +1395,10 @@ void k_measure_promoted_impl(MeasureArgs3D args,
     const int slot = static_cast<int>(blockIdx.x);
     if (slot >= promoted_count) return;
     const int n = promoted_ids[slot];
-    if (n < 0 || n >= args.N || promoted_phi[n] == nullptr ||
-        cell_support_edge(args.cells[n], args.B) != promoted_edge)
-        return;
-    measure_one_cell<WallCoupling>(args, n, promoted_edge, promoted_phi[n],
+    if (n < 0 || n >= args.N || promoted_phi[n] == nullptr) return;
+    const int B = promoted_cell_edge(args.cells[n], args.B, promoted_edge);
+    if (B == 0) return;
+    measure_one_cell<WallCoupling>(args, n, B, promoted_phi[n],
                                    halo_pair, warp_values);
 }
 
@@ -1170,22 +1422,33 @@ void k_measure_promoted_shards_impl(MeasureArgs3D args,
     const int shard = block - slot * args.shards;
     if (slot >= promoted_count) return;
     const int n = promoted_ids[slot];
-    if (n < 0 || n >= args.N || promoted_phi[n] == nullptr ||
-        cell_support_edge(args.cells[n], args.B) != promoted_edge)
-        return;
-
-    const int B = promoted_edge;
+    if (n < 0 || n >= args.N || promoted_phi[n] == nullptr) return;
+    const int B = promoted_cell_edge(args.cells[n], args.B, promoted_edge);
+    if (B == 0) return;
     CellState3D* state = &args.cells[n];
     const float* tile = promoted_phi[n];
     const int ox = wrap_origin(state->origin_x, args.layout.nx);
     const int oy = wrap_origin(state->origin_y, args.layout.ny);
+
+    const std::int64_t origin_z = state->origin_z;
+    const bool bounded_z = args.layout.bounded_z();
+    const auto z_map = bounded_z
+        ? BoundedZMap::make(origin_z, B, args.layout.nz,
+                           args.layout.hard_wall_channel())
+        : BoundedZMap{};
+    const auto fetch_z = [&](int z, int* source_z) {
+        return bounded_z ? z_map.fetch(z, source_z)
+            : phase_fetch_local_z(args.layout, origin_z, z, B, source_z);
+    };
+    const int storage_z_offset = args.storage.compact(B)
+        ? static_cast<int>(origin_z) : 0;
 
     Reduction3D local = empty_reduction(B);
     const int bricks_x = (B + kBrickX - 1) / kBrickX;
     const int bricks_y = (B + kBrickY - 1) / kBrickY;
     const int bricks_z = (B + kBrickZ - 1) / kBrickZ;
     int tz_begin = 0, tz_end = bricks_z;
-    live_tile_z_range(args.layout, state->origin_z, B, bricks_z,
+    live_tile_z_range(args.layout, origin_z, B, bricks_z,
                       &tz_begin, &tz_end);
     const int bricks_per_plane = bricks_x * bricks_y;
     const int brick_begin = tz_begin * bricks_per_plane;
@@ -1197,13 +1460,13 @@ void k_measure_promoted_shards_impl(MeasureArgs3D args,
     float* const halo1 = halo_pair + kHaloVoxels;
     int parity = 0;
     if (first_brick < brick_end)
-        prefetch_halo(tile, B, first_brick, bricks_x, bricks_y, args.layout,
-                      state->origin_z, halo0);
+        prefetch_halo(tile, B, first_brick, bricks_x, bricks_y, fetch_z,
+                      storage_z_offset, halo0);
     for (int brick = first_brick; brick < brick_end; brick += args.shards) {
         const bool more = brick + args.shards < brick_end;
         if (more)
             prefetch_halo(tile, B, brick + args.shards, bricks_x, bricks_y,
-                          args.layout, state->origin_z,
+                          fetch_z, storage_z_offset,
                           parity == 0 ? halo1 : halo0);
         __pipeline_wait_prior(more ? 1 : 0);
         float* const shared_phi = parity == 0 ? halo0 : halo1;
@@ -1222,7 +1485,9 @@ void k_measure_promoted_shards_impl(MeasureArgs3D args,
                 const int x = x0 + ix, y = y0 + iy, z = z0 + iz;
                 if (x >= B || y >= B || z >= B) continue;
                 int wz = 0;
-                if (!aggregate_z(args.layout, state->origin_z, z, &wz))
+                const bool mapped = bounded_z ? z_map.aggregate(z, &wz)
+                    : aggregate_z(args.layout, origin_z, z, &wz);
+                if (!mapped)
                     continue;
                 const float centre = shared_phi[halo_index(ix + 1, iy + 1,
                                                            iz + 1)];
@@ -1288,15 +1553,15 @@ __global__ void k_finalize_measure_promoted(
     const int slot = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (slot >= promoted_count) return;
     const int n = promoted_ids[slot];
-    if (n < 0 || n >= args.N ||
-        cell_support_edge(args.cells[n], args.B) != promoted_edge)
-        return;
-    Reduction3D total = empty_reduction(promoted_edge);
+    if (n < 0 || n >= args.N) return;
+    const int B = promoted_cell_edge(args.cells[n], args.B, promoted_edge);
+    if (B == 0) return;
+    Reduction3D total = empty_reduction(B);
     const MomentPartial3D* parts =
         promoted_partials + static_cast<std::size_t>(slot) * args.shards;
     for (int shard = 0; shard < args.shards; ++shard)
         append_reduction(&total, parts[shard]);
-    commit_measurement(args, n, promoted_edge, total);
+    commit_measurement(args, n, B, total);
 }
 
 template <bool WallCoupling>
@@ -1305,23 +1570,38 @@ void k_measure_cell_shards_impl(MeasureArgs3D args) {
     extern __shared__ float halo_pair[];
     __shared__ Reduction3D warp_values[kWarps3D];
     const int block = static_cast<int>(blockIdx.x);
-    const int n = block / args.shards;
-    const int shard = block - n * args.shards;
-    if (n >= args.N || cell_is_promoted(args.cells[n], args.B)) return;
+    const int slot = block / args.shards;
+    const int shard = block - slot * args.shards;
+    if (slot >= args.selection.selected_count(args.N)) return;
+    const int n = args.selection.cell_index(slot);
+    if (cell_is_promoted(args.cells[n], args.B)) return;
 
     const int B = args.B;
-    const std::size_t words = cell_words(B);
+    const std::size_t words = stored_cell_words(B, args.storage);
     CellState3D* state = &args.cells[n];
     const float* tile = args.phi + static_cast<std::size_t>(n) * words;
     const int ox = wrap_origin(state->origin_x, args.layout.nx);
     const int oy = wrap_origin(state->origin_y, args.layout.ny);
+    // Recentering commits after measurement; every tile uses this same origin.
+    const std::int64_t origin_z = state->origin_z;
+    const bool bounded_z = args.layout.bounded_z();
+    const auto z_map = bounded_z
+        ? BoundedZMap::make(origin_z, B, args.layout.nz,
+                           args.layout.hard_wall_channel())
+        : BoundedZMap{};
+    const auto fetch_z = [&](int z, int* source_z) {
+        return bounded_z ? z_map.fetch(z, source_z)
+            : phase_fetch_local_z(args.layout, origin_z, z, B, source_z);
+    };
+    const int storage_z_offset = args.storage.compact(B)
+        ? static_cast<int>(origin_z) : 0;
 
     Reduction3D local = empty_reduction(B);
     const int bricks_x = (B + kBrickX - 1) / kBrickX;
     const int bricks_y = (B + kBrickY - 1) / kBrickY;
     const int bricks_z = (B + kBrickZ - 1) / kBrickZ;
     int tz_begin = 0, tz_end = bricks_z;
-    live_tile_z_range(args.layout, state->origin_z, B, bricks_z,
+    live_tile_z_range(args.layout, origin_z, B, bricks_z,
                       &tz_begin, &tz_end);
     const int bricks_per_plane = bricks_x * bricks_y;
     const int brick_begin = tz_begin * bricks_per_plane;
@@ -1333,13 +1613,13 @@ void k_measure_cell_shards_impl(MeasureArgs3D args) {
     float* const halo1 = halo_pair + kHaloVoxels;
     int parity = 0;
     if (first_brick < brick_end)
-        prefetch_halo(tile, B, first_brick, bricks_x, bricks_y, args.layout,
-                      state->origin_z, halo0);
+        prefetch_halo(tile, B, first_brick, bricks_x, bricks_y, fetch_z,
+                      storage_z_offset, halo0);
     for (int brick = first_brick; brick < brick_end; brick += args.shards) {
         const bool more = brick + args.shards < brick_end;
         if (more)
             prefetch_halo(tile, B, brick + args.shards, bricks_x, bricks_y,
-                          args.layout, state->origin_z,
+                          fetch_z, storage_z_offset,
                           parity == 0 ? halo1 : halo0);
         __pipeline_wait_prior(more ? 1 : 0);
         float* const shared_phi = parity == 0 ? halo0 : halo1;
@@ -1358,7 +1638,9 @@ void k_measure_cell_shards_impl(MeasureArgs3D args) {
                 const int x = x0 + ix, y = y0 + iy, z = z0 + iz;
                 if (x >= B || y >= B || z >= B) continue;
                 int wz = 0;
-                if (!aggregate_z(args.layout, state->origin_z, z, &wz))
+                const bool mapped = bounded_z ? z_map.aggregate(z, &wz)
+                    : aggregate_z(args.layout, origin_z, z, &wz);
+                if (!mapped)
                     continue;
                 const float centre = shared_phi[halo_index(ix + 1, iy + 1,
                                                            iz + 1)];
@@ -1418,8 +1700,10 @@ void k_measure_cell_shards_impl(MeasureArgs3D args) {
 }
 
 __global__ void k_finalize_measure_cell_shards(MeasureArgs3D args) {
-    const int n = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (n >= args.N || cell_is_promoted(args.cells[n], args.B)) return;
+    const int slot = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (slot >= args.selection.selected_count(args.N)) return;
+    const int n = args.selection.cell_index(slot);
+    if (cell_is_promoted(args.cells[n], args.B)) return;
     Reduction3D total = empty_reduction(args.B);
     const MomentPartial3D* parts =
         args.partials + static_cast<std::size_t>(n) * args.shards;
@@ -1429,8 +1713,9 @@ __global__ void k_finalize_measure_cell_shards(MeasureArgs3D args) {
 }
 
 __global__ void k_apply_cell_motion(MeasureArgs3D args) {
-    const int n = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (n >= args.N) return;
+    const int slot = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (slot >= args.selection.selected_count(args.N)) return;
+    const int n = args.selection.cell_index(slot);
     CellState3D* state = &args.cells[n];
     if (fatal_flags_present(state, args.global_flags)) return;
 
@@ -1488,14 +1773,15 @@ void k_update_tiled_impl(UpdateArgs3D args) {
     for (;;) {
         if (threadIdx.x == 0) {
             const unsigned long long ticket = atomicAdd(args.work_cursor, 1ull);
-            cell_number = ticket < static_cast<unsigned long long>(args.N)
-                ? static_cast<int>(ticket) : -1;
+            cell_number = ticket < static_cast<unsigned long long>(
+                args.selection.selected_count(args.N))
+                ? args.selection.cell_index(static_cast<int>(ticket)) : -1;
         }
         __syncthreads();
         const int n = cell_number;
         if (n < 0) break;
         if (cell_is_promoted(args.cells[n], args.B)) continue;
-        const std::size_t words = cell_words(args.B);
+        const std::size_t words = stored_cell_words(args.B, args.storage);
         const float* source =
             args.phi_in + static_cast<std::size_t>(n) * words;
         float* destination = args.phi_out + static_cast<std::size_t>(n) * words;
@@ -1515,14 +1801,15 @@ void k_update_tiled_fast_impl(UpdateArgs3D args) {
     for (;;) {
         if (threadIdx.x == 0) {
             const unsigned long long ticket = atomicAdd(args.work_cursor, 1ull);
-            cell_number = ticket < static_cast<unsigned long long>(args.N)
-                ? static_cast<int>(ticket) : -1;
+            cell_number = ticket < static_cast<unsigned long long>(
+                args.selection.selected_count(args.N))
+                ? args.selection.cell_index(static_cast<int>(ticket)) : -1;
         }
         __syncthreads();
         const int n = cell_number;
         if (n < 0) break;
         if (cell_is_promoted(args.cells[n], args.B)) continue;
-        const std::size_t words = cell_words(args.B);
+        const std::size_t words = stored_cell_words(args.B, args.storage);
         const float* source =
             args.phi_in + static_cast<std::size_t>(n) * words;
         float* destination = args.phi_out + static_cast<std::size_t>(n) * words;
@@ -1541,10 +1828,12 @@ void k_update_tiled_sharded_impl(UpdateArgs3D args,
     __shared__ Reduction3D warp_values[kWarps3D];
     __shared__ int abort_flag;
     const int block = static_cast<int>(blockIdx.x);
-    const int n = block / shards_per_cell;
-    const int shard = block - n * shards_per_cell;
-    if (n >= args.N || cell_is_promoted(args.cells[n], args.B)) return;
-    const std::size_t words = cell_words(args.B);
+    const int slot = block / shards_per_cell;
+    const int shard = block - slot * shards_per_cell;
+    if (slot >= args.selection.selected_count(args.N)) return;
+    const int n = args.selection.cell_index(slot);
+    if (cell_is_promoted(args.cells[n], args.B)) return;
+    const std::size_t words = stored_cell_words(args.B, args.storage);
     process_update_shard<true, WallCoupling>(
         n, shard, shards_per_cell, args,
         args.phi_in + static_cast<std::size_t>(n) * words,
@@ -1552,18 +1841,20 @@ void k_update_tiled_sharded_impl(UpdateArgs3D args,
         args.B, partials, halo_pair, warp_values, &abort_flag);
 }
 
-template <bool WallCoupling>
-__global__ __launch_bounds__(kThreads3D, 4)
+template <bool WallCoupling, UpdateTilePass3D Pass = UpdateTilePass3D::All>
+__global__ __launch_bounds__(kThreads3D, 3)
 void k_update_tiled_sharded_fast_impl(UpdateArgs3D args,
                                       int shards_per_cell) {
     extern __shared__ float halo_pair[];
     __shared__ int abort_flag;
     const int block = static_cast<int>(blockIdx.x);
-    const int n = block / shards_per_cell;
-    const int shard = block - n * shards_per_cell;
-    if (n >= args.N || cell_is_promoted(args.cells[n], args.B)) return;
-    const std::size_t words = cell_words(args.B);
-    process_update_shard<false, WallCoupling>(
+    const int slot = block / shards_per_cell;
+    const int shard = block - slot * shards_per_cell;
+    if (slot >= args.selection.selected_count(args.N)) return;
+    const int n = args.selection.cell_index(slot);
+    if (cell_is_promoted(args.cells[n], args.B)) return;
+    const std::size_t words = stored_cell_words(args.B, args.storage);
+    process_update_shard<false, WallCoupling, Pass>(
         n, shard, shards_per_cell, args,
         args.phi_in + static_cast<std::size_t>(n) * words,
         args.phi_out + static_cast<std::size_t>(n) * words,
@@ -1576,7 +1867,8 @@ void k_update_tiled_sharded_fast_impl(UpdateArgs3D args,
 // arithmetic is process_update_shard's, so outputs are bit-identical to the
 // one-CTA promoted update; the destination cubes must be cleared first
 // because shards skip absent voxels instead of zero-filling.
-__global__ void k_clear_promoted_out(float* const* promoted_phi_out,
+__global__ void k_clear_promoted_out(UpdateArgs3D args,
+                                     float* const* promoted_phi_out,
                                      const int* promoted_ids,
                                      int promoted_count, int promoted_edge,
                                      int blocks_per_cube) {
@@ -1585,10 +1877,12 @@ __global__ void k_clear_promoted_out(float* const* promoted_phi_out,
     const int part = block - slot * blocks_per_cube;
     if (slot >= promoted_count) return;
     const int n = promoted_ids[slot];
-    if (n < 0) return;
+    if (n < 0 || n >= args.N) return;
     float* out = promoted_phi_out[n];
     if (out == nullptr) return;
-    const std::size_t words = cell_words(promoted_edge);
+    const int B = promoted_cell_edge(args.cells[n], args.B, promoted_edge);
+    if (B == 0) return;
+    const std::size_t words = stored_cell_words(B, args.storage);
     const std::size_t stride =
         static_cast<std::size_t>(blocks_per_cube) * blockDim.x;
     for (std::size_t q = static_cast<std::size_t>(part) * blockDim.x
@@ -1597,8 +1891,8 @@ __global__ void k_clear_promoted_out(float* const* promoted_phi_out,
         out[q] = 0.0f;
 }
 
-template <bool WallCoupling>
-__global__ __launch_bounds__(kThreads3D, 4)
+template <bool WallCoupling, UpdateTilePass3D Pass = UpdateTilePass3D::All>
+__global__ __launch_bounds__(kThreads3D, 3)
 void k_update_promoted_sharded_fast_impl(
     UpdateArgs3D args, float* const* promoted_phi_in,
     float* const* promoted_phi_out, const int* promoted_ids,
@@ -1612,19 +1906,22 @@ void k_update_promoted_sharded_fast_impl(
     const int n = promoted_ids[slot];
     if (n < 0 || n >= args.N || promoted_phi_in[n] == nullptr ||
         promoted_phi_out[n] == nullptr ||
-        promoted_phi_in[n] == promoted_phi_out[n] ||
-        cell_support_edge(args.cells[n], args.B) != promoted_edge)
+        promoted_phi_in[n] == promoted_phi_out[n])
         return;
-    process_update_shard<false, WallCoupling>(
+    const int B = promoted_cell_edge(args.cells[n], args.B, promoted_edge);
+    if (B == 0) return;
+    process_update_shard<false, WallCoupling, Pass>(
         n, shard, shards_per_cell, args, promoted_phi_in[n],
-        promoted_phi_out[n], promoted_edge, nullptr, halo_pair, nullptr,
+        promoted_phi_out[n], B, nullptr, halo_pair, nullptr,
         &abort_flag);
 }
 
 __global__ void k_finalize_tiled_sharded(
     UpdateArgs3D args, const MomentPartial3D* partials, int shards_per_cell) {
-    const int n = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (n >= args.N || cell_is_promoted(args.cells[n], args.B)) return;
+    const int slot = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (slot >= args.selection.selected_count(args.N)) return;
+    const int n = args.selection.cell_index(slot);
+    if (cell_is_promoted(args.cells[n], args.B)) return;
 
     Reduction3D total{};
     total.lo_x = total.lo_y = total.lo_z = args.B;
@@ -1680,14 +1977,15 @@ void k_update_inplace_impl(UpdateArgs3D args, float* scratch,
     extern __shared__ float halo_pair[];
     __shared__ Reduction3D warp_values[kWarps3D];
     __shared__ int cell_number;
-    const std::size_t words = cell_words(args.B);
+    const std::size_t words = stored_cell_words(args.B, args.storage);
     float* block_scratch = scratch + static_cast<std::size_t>(blockIdx.x) * words;
 
     for (;;) {
         if (threadIdx.x == 0) {
             const unsigned long long ticket = atomicAdd(args.work_cursor, 1ull);
-            cell_number = ticket < static_cast<unsigned long long>(args.N)
-                ? static_cast<int>(ticket) : -1;
+            cell_number = ticket < static_cast<unsigned long long>(
+                args.selection.selected_count(args.N))
+                ? args.selection.cell_index(static_cast<int>(ticket)) : -1;
         }
         __syncthreads();
         const int n = cell_number;
@@ -1731,14 +2029,15 @@ void k_update_inplace_fast_impl(UpdateArgs3D args, float* scratch,
     extern __shared__ float halo_pair[];
     __shared__ int cell_number;
     __shared__ int abort_flag;
-    const std::size_t words = cell_words(args.B);
+    const std::size_t words = stored_cell_words(args.B, args.storage);
     float* block_scratch = scratch + static_cast<std::size_t>(blockIdx.x) * words;
 
     for (;;) {
         if (threadIdx.x == 0) {
             const unsigned long long ticket = atomicAdd(args.work_cursor, 1ull);
-            cell_number = ticket < static_cast<unsigned long long>(args.N)
-                ? static_cast<int>(ticket) : -1;
+            cell_number = ticket < static_cast<unsigned long long>(
+                args.selection.selected_count(args.N))
+                ? args.selection.cell_index(static_cast<int>(ticket)) : -1;
         }
         __syncthreads();
         const int n = cell_number;
@@ -1787,16 +2086,17 @@ void k_update_promoted_impl(UpdateArgs3D args,
     const int n = promoted_ids[slot];
     if (n < 0 || n >= args.N || promoted_phi_in[n] == nullptr ||
         promoted_phi_out[n] == nullptr ||
-        promoted_phi_in[n] == promoted_phi_out[n] ||
-        cell_support_edge(args.cells[n], args.B) != promoted_edge)
+        promoted_phi_in[n] == promoted_phi_out[n])
         return;
+    const int B = promoted_cell_edge(args.cells[n], args.B, promoted_edge);
+    if (B == 0) return;
     if (collect_moments) {
         process_update_cell<true, WallCoupling>(
-            n, args, promoted_phi_in[n], promoted_phi_out[n], promoted_edge,
+            n, args, promoted_phi_in[n], promoted_phi_out[n], B,
             halo_pair, warp_values, nullptr);
     } else {
         process_update_cell<false, WallCoupling>(
-            n, args, promoted_phi_in[n], promoted_phi_out[n], promoted_edge,
+            n, args, promoted_phi_in[n], promoted_phi_out[n], B,
             halo_pair, nullptr, &abort_flag);
     }
 }
@@ -1815,8 +2115,9 @@ __global__ void k_repair_after_fatal(UpdateArgs3D args) {
         __syncthreads();
     }
 
-    const std::size_t words = cell_words(args.B);
-    for (int n = 0; n < args.N; ++n) {
+    const std::size_t words = stored_cell_words(args.B, args.storage);
+    for (int slot = 0; slot < args.selection.selected_count(args.N); ++slot) {
+        const int n = args.selection.cell_index(slot);
         CellState3D* state = &args.cells[n];
         if (cell_is_promoted(*state, args.B)) continue;
         float* source = args.phi_in + static_cast<std::size_t>(n) * words;
@@ -1861,8 +2162,11 @@ __global__ void k_repair_after_fatal(UpdateArgs3D args) {
                 const int x = static_cast<int>(q % static_cast<std::size_t>(args.B));
                 const int y = static_cast<int>((q / static_cast<std::size_t>(args.B))
                                               % static_cast<std::size_t>(args.B));
-                const int z = static_cast<int>(
+                const int stored_z = static_cast<int>(
                     q / (static_cast<std::size_t>(args.B) * args.B));
+                int z = 0;
+                if (!logical_z_from_stored(stored_z, args.B, effective_z,
+                                           args.storage, &z)) continue;
                 int wz = 0;
                 if (!aggregate_z(args.layout, effective_z, z, &wz)) continue;
                 scatter_value(
@@ -1888,13 +2192,14 @@ __global__ void k_repair_promoted_after_fatal(
     __syncthreads();
     if (repair == 0) return;
 
-    const std::size_t words = cell_words(promoted_edge);
     for (int slot = 0; slot < promoted_count; ++slot) {
         const int n = promoted_ids[slot];
         if (n < 0 || n >= args.N || promoted_phi_in[n] == nullptr ||
-            promoted_phi_out[n] == nullptr ||
-            cell_support_edge(args.cells[n], args.B) != promoted_edge)
+            promoted_phi_out[n] == nullptr)
             continue;
+        const int B = promoted_cell_edge(args.cells[n], args.B, promoted_edge);
+        if (B == 0) continue;
+        const std::size_t words = stored_cell_words(B, args.storage);
         CellState3D* state = &args.cells[n];
         const float* source = promoted_phi_in[n];
         float* output = promoted_phi_out[n];
@@ -1916,12 +2221,13 @@ __global__ void k_repair_promoted_after_fatal(
                     raise_flag(state, args.global_flags, FLAG3D_NONFINITE);
                     continue;
                 }
-                const int x = static_cast<int>(q % promoted_edge);
-                const int y = static_cast<int>((q / promoted_edge)
-                                              % promoted_edge);
-                const int z = static_cast<int>(
-                    q / (static_cast<std::size_t>(promoted_edge)
-                         * promoted_edge));
+                const int x = static_cast<int>(q % B);
+                const int y = static_cast<int>((q / B) % B);
+                const int stored_z = static_cast<int>(
+                    q / (static_cast<std::size_t>(B) * B));
+                int z = 0;
+                if (!logical_z_from_stored(stored_z, B, state->origin_z,
+                                           args.storage, &z)) continue;
                 int wz = 0;
                 if (!aggregate_z(args.layout, state->origin_z, z, &wz))
                     continue;
@@ -2031,7 +2337,8 @@ void k_measure_wall_diagnostics(const float* phi,
                             float* const* promoted_phi,
                             CellState3D* cells, int N, int B,
                             SLayout3D layout, const float* wall_psi_sq,
-                            int channel_height, int channel_padding) {
+                            int channel_height, int channel_padding,
+                            CellFieldStorage3D storage) {
     const int n = static_cast<int>(blockIdx.x);
     if (n >= N) return;
     __shared__ double overlap_by_warp[kWarps3D];
@@ -2039,7 +2346,7 @@ void k_measure_wall_diagnostics(const float* phi,
     CellState3D* state = &cells[n];
     const int edge = cell_support_edge(*state, B);
     const float* tile = edge == B
-        ? phi + static_cast<std::size_t>(n) * cell_words(B)
+        ? phi + static_cast<std::size_t>(n) * stored_cell_words(B, storage)
         : promoted_phi != nullptr ? promoted_phi[n] : nullptr;
     double overlap = 0.0;
     double outside = 0.0;
@@ -2050,7 +2357,8 @@ void k_measure_wall_diagnostics(const float* phi,
                 q / (static_cast<std::size_t>(edge) * edge));
             int world_z = 0;
             if (!aggregate_z(layout, state->origin_z, z, &world_z)) continue;
-            const double value = static_cast<double>(tile[q]);
+            const double value = static_cast<double>(
+                logical_field_value(tile, q, edge, state->origin_z, storage));
             const double phi_sq = value * value;
             overlap += phi_sq * static_cast<double>(wall_psi_sq[world_z]);
             if (world_z < channel_padding ||
@@ -2081,6 +2389,7 @@ void k_measure_wall_diagnostics(const float* phi,
 __device__ void verify_one_cell(const float* tile, const CellState3D* cells,
                                  VerifyCell3D* out, int n, int B,
                                  SLayout3D layout,
+                                 const CellFieldStorage3D& storage,
                                  double* volume_by_warp,
                                 unsigned int* max_by_warp,
                                 unsigned int* bad_by_warp,
@@ -2089,7 +2398,7 @@ __device__ void verify_one_cell(const float* tile, const CellState3D* cells,
     double volume = 0.0;
     unsigned int max_bits = 0u, nonfinite = 0u, edge = 0u;
     for (std::size_t q = threadIdx.x; q < words; q += kThreads3D) {
-        const float value = tile[q];
+        const float value = logical_field_value(tile, q, B, cells[n].origin_z, storage);
         if (!isfinite(value)) {
             ++nonfinite;
             continue;
@@ -2148,16 +2457,17 @@ __device__ void verify_one_cell(const float* tile, const CellState3D* cells,
 
 __global__ __launch_bounds__(kThreads3D, 1)
 void k_verify_cells(const float* phi, const CellState3D* cells,
-                    VerifyCell3D* out, int N, int B, SLayout3D layout) {
+                    VerifyCell3D* out, int N, int B, SLayout3D layout,
+                    CellFieldStorage3D storage) {
     __shared__ double volume_by_warp[kWarps3D];
     __shared__ unsigned int max_by_warp[kWarps3D];
     __shared__ unsigned int bad_by_warp[kWarps3D];
     __shared__ unsigned int edge_by_warp[kWarps3D];
     const int n = static_cast<int>(blockIdx.x);
     if (n >= N || cell_is_promoted(cells[n], B)) return;
-    const std::size_t words = cell_words(B);
+    const std::size_t words = stored_cell_words(B, storage);
     verify_one_cell(phi + static_cast<std::size_t>(n) * words, cells, out,
-                    n, B, layout, volume_by_warp, max_by_warp, bad_by_warp,
+                    n, B, layout, storage, volume_by_warp, max_by_warp, bad_by_warp,
                     edge_by_warp);
 }
 
@@ -2165,7 +2475,8 @@ __global__ __launch_bounds__(kThreads3D, 1)
 void k_verify_promoted(float* const* promoted_phi,
                        const CellState3D* cells, VerifyCell3D* out,
                        const int* promoted_ids, int N, int promoted_count,
-                       int promoted_edge, SLayout3D layout) {
+                       int promoted_edge, SLayout3D layout,
+                       CellFieldStorage3D storage) {
     __shared__ double volume_by_warp[kWarps3D];
     __shared__ unsigned int max_by_warp[kWarps3D];
     __shared__ unsigned int bad_by_warp[kWarps3D];
@@ -2173,10 +2484,10 @@ void k_verify_promoted(float* const* promoted_phi,
     const int slot = static_cast<int>(blockIdx.x);
     if (slot >= promoted_count) return;
     const int n = promoted_ids[slot];
-    if (n < 0 || n >= N || promoted_phi[n] == nullptr ||
-        cell_support_edge(cells[n], 0) != promoted_edge)
-        return;
-    verify_one_cell(promoted_phi[n], cells, out, n, promoted_edge, layout,
+    if (n < 0 || n >= N || promoted_phi[n] == nullptr) return;
+    const int B = promoted_cell_edge(cells[n], 0, promoted_edge);
+    if (B == 0) return;
+    verify_one_cell(promoted_phi[n], cells, out, n, B, layout, storage,
                     volume_by_warp, max_by_warp, bad_by_warp, edge_by_warp);
 }
 
@@ -2195,55 +2506,157 @@ namespace {
 
 // The brick-walking kernels need their dynamic-shared-memory limit raised
 // above the 48 KiB default before the first launch or occupancy query.
+thread_local bool tile_kernels_configured = false;
+
+cudaError_t configure_current_tile_kernels() {
+    const void* kernels[] = {
+        reinterpret_cast<const void*>(k_measure_cells_impl<false>),
+        reinterpret_cast<const void*>(k_measure_cells_impl<true>),
+        reinterpret_cast<const void*>(k_measure_promoted_impl<false>),
+        reinterpret_cast<const void*>(k_measure_promoted_impl<true>),
+        reinterpret_cast<const void*>(k_measure_cell_shards_impl<false>),
+        reinterpret_cast<const void*>(k_measure_cell_shards_impl<true>),
+        reinterpret_cast<const void*>(k_update_tiled_impl<false>),
+        reinterpret_cast<const void*>(k_update_tiled_impl<true>),
+        reinterpret_cast<const void*>(k_update_tiled_fast_impl<false>),
+        reinterpret_cast<const void*>(k_update_tiled_fast_impl<true>),
+        reinterpret_cast<const void*>(k_update_tiled_sharded_impl<false>),
+        reinterpret_cast<const void*>(k_update_tiled_sharded_impl<true>),
+        reinterpret_cast<const void*>(k_update_tiled_sharded_fast_impl<false>),
+        reinterpret_cast<const void*>(k_update_tiled_sharded_fast_impl<true>),
+        reinterpret_cast<const void*>(k_update_tiled_sharded_fast_impl<
+            false, UpdateTilePass3D::Boundary>),
+        reinterpret_cast<const void*>(k_update_tiled_sharded_fast_impl<
+            false, UpdateTilePass3D::Interior>),
+        reinterpret_cast<const void*>(k_update_tiled_sharded_fast_impl<
+            true, UpdateTilePass3D::Boundary>),
+        reinterpret_cast<const void*>(k_update_tiled_sharded_fast_impl<
+            true, UpdateTilePass3D::Interior>),
+        reinterpret_cast<const void*>(k_update_inplace_impl<false>),
+        reinterpret_cast<const void*>(k_update_inplace_impl<true>),
+        reinterpret_cast<const void*>(k_update_inplace_fast_impl<false>),
+        reinterpret_cast<const void*>(k_update_inplace_fast_impl<true>),
+        reinterpret_cast<const void*>(k_update_promoted_impl<false>),
+        reinterpret_cast<const void*>(k_update_promoted_impl<true>),
+        reinterpret_cast<const void*>(
+            k_update_promoted_sharded_fast_impl<false>),
+        reinterpret_cast<const void*>(
+            k_update_promoted_sharded_fast_impl<true>),
+        reinterpret_cast<const void*>(k_update_promoted_sharded_fast_impl<
+            false, UpdateTilePass3D::Boundary>),
+        reinterpret_cast<const void*>(k_update_promoted_sharded_fast_impl<
+            false, UpdateTilePass3D::Interior>),
+        reinterpret_cast<const void*>(k_update_promoted_sharded_fast_impl<
+            true, UpdateTilePass3D::Boundary>),
+        reinterpret_cast<const void*>(k_update_promoted_sharded_fast_impl<
+            true, UpdateTilePass3D::Interior>),
+        reinterpret_cast<const void*>(k_measure_promoted_shards_impl<false>),
+        reinterpret_cast<const void*>(k_measure_promoted_shards_impl<true>),
+    };
+    for (const void* kernel : kernels) {
+        const cudaError_t error = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(kHaloPipelineBytes));
+        if (error != cudaSuccess) return error;
+    }
+    tile_kernels_configured = true;
+    return cudaSuccess;
+}
+
 cudaError_t set_tile_kernel_smem_limit() {
-    static const cudaError_t status = []() {
-        const void* kernels[] = {
-            reinterpret_cast<const void*>(k_measure_cells_impl<false>),
-            reinterpret_cast<const void*>(k_measure_cells_impl<true>),
-            reinterpret_cast<const void*>(k_measure_promoted_impl<false>),
-            reinterpret_cast<const void*>(k_measure_promoted_impl<true>),
-            reinterpret_cast<const void*>(k_measure_cell_shards_impl<false>),
-            reinterpret_cast<const void*>(k_measure_cell_shards_impl<true>),
-            reinterpret_cast<const void*>(k_update_tiled_impl<false>),
-            reinterpret_cast<const void*>(k_update_tiled_impl<true>),
-            reinterpret_cast<const void*>(k_update_tiled_fast_impl<false>),
-            reinterpret_cast<const void*>(k_update_tiled_fast_impl<true>),
-            reinterpret_cast<const void*>(k_update_tiled_sharded_impl<false>),
-            reinterpret_cast<const void*>(k_update_tiled_sharded_impl<true>),
-            reinterpret_cast<const void*>(
-                k_update_tiled_sharded_fast_impl<false>),
-            reinterpret_cast<const void*>(
-                k_update_tiled_sharded_fast_impl<true>),
-            reinterpret_cast<const void*>(k_update_inplace_impl<false>),
-            reinterpret_cast<const void*>(k_update_inplace_impl<true>),
-            reinterpret_cast<const void*>(k_update_inplace_fast_impl<false>),
-            reinterpret_cast<const void*>(k_update_inplace_fast_impl<true>),
-            reinterpret_cast<const void*>(k_update_promoted_impl<false>),
-            reinterpret_cast<const void*>(k_update_promoted_impl<true>),
-            reinterpret_cast<const void*>(
-                k_update_promoted_sharded_fast_impl<false>),
-            reinterpret_cast<const void*>(
-                k_update_promoted_sharded_fast_impl<true>),
-            reinterpret_cast<const void*>(
-                k_measure_promoted_shards_impl<false>),
-            reinterpret_cast<const void*>(
-                k_measure_promoted_shards_impl<true>),
-        };
-        for (const void* kernel : kernels) {
-            const cudaError_t error = cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(kHaloPipelineBytes));
-            if (error != cudaSuccess) return error;
-        }
-        return cudaSuccess;
-    }();
-    return status;
+    return tile_kernels_configured ? cudaSuccess
+                                  : configure_current_tile_kernels();
+}
+
+bool valid_update_partition(const UpdateArgs3D& args) {
+    if (args.tile_pass == UpdateTilePass3D::All) return true;
+    return valid_update_tile_pass(args.tile_pass)
+        && args.layout.bounded_z()
+        && args.phi_out != nullptr && args.S_out != nullptr
+        && valid_tile_exchange_region(args.exchange_region,
+                                      args.layout.ny, args.layout.nz);
+}
+
+bool valid_runtime_field(int B, const SLayout3D& layout,
+                         const CellFieldStorage3D& storage) {
+    return valid_runtime_geometry(B, layout) && valid_field_storage(storage, B, layout);
+}
+
+bool checked_stored_field_bytes(int N, int B, const CellFieldStorage3D& storage,
+                                std::size_t* bytes) {
+    std::size_t one = 0;
+    return N > 0 && storage.checked_bytes(B, &one) &&
+           checked_mul_size(static_cast<std::size_t>(N), one, bytes);
+}
+
+cudaError_t clear_base_output(const UpdateArgs3D& args,
+                              std::size_t phi_bytes, cudaStream_t stream) {
+    if (args.selection.ids == nullptr)
+        return cudaMemsetAsync(args.phi_out, 0, phi_bytes, stream);
+    constexpr int kClearBlocksPerCell = 64;
+    if (args.selection.count >
+        std::numeric_limits<int>::max() / kClearBlocksPerCell)
+        return cudaErrorInvalidValue;
+    k_clear_selected_base_out<<<args.selection.count * kClearBlocksPerCell,
+                                kThreads3D, 0, stream>>>(
+        args, kClearBlocksPerCell);
+    return cudaPeekAtLastError();
+}
+
+// The exchange partition changes scheduling, not the wall term or stencil.
+// Both passes use the same geometry specialization as the unsplit update.
+template <bool WallCoupling>
+void enqueue_base_fast_pass(const UpdateArgs3D& args, int count,
+                            int shards_per_cell, cudaStream_t stream) {
+    const int blocks = count * shards_per_cell;
+    if (args.tile_pass == UpdateTilePass3D::Boundary)
+        k_update_tiled_sharded_fast_impl<WallCoupling,
+                                         UpdateTilePass3D::Boundary>
+            <<<blocks, kThreads3D, kHaloPipelineBytes, stream>>>(
+                args, shards_per_cell);
+    else if (args.tile_pass == UpdateTilePass3D::Interior)
+        k_update_tiled_sharded_fast_impl<WallCoupling,
+                                         UpdateTilePass3D::Interior>
+            <<<blocks, kThreads3D, kHaloPipelineBytes, stream>>>(
+                args, shards_per_cell);
+    else
+        k_update_tiled_sharded_fast_impl<WallCoupling>
+            <<<blocks, kThreads3D, kHaloPipelineBytes, stream>>>(
+                args, shards_per_cell);
+}
+
+template <bool WallCoupling>
+void enqueue_promoted_fast_pass(
+    const UpdateArgs3D& args, float* const* promoted_phi_in,
+    float* const* promoted_phi_out, const int* promoted_ids,
+    int promoted_count, int promoted_edge, int shards_per_cell,
+    cudaStream_t stream) {
+    const int blocks = promoted_count * shards_per_cell;
+    if (args.tile_pass == UpdateTilePass3D::Boundary)
+        k_update_promoted_sharded_fast_impl<WallCoupling,
+                                            UpdateTilePass3D::Boundary>
+            <<<blocks, kThreads3D, kHaloPipelineBytes, stream>>>(
+                args, promoted_phi_in, promoted_phi_out, promoted_ids,
+                promoted_count, promoted_edge, shards_per_cell);
+    else if (args.tile_pass == UpdateTilePass3D::Interior)
+        k_update_promoted_sharded_fast_impl<WallCoupling,
+                                            UpdateTilePass3D::Interior>
+            <<<blocks, kThreads3D, kHaloPipelineBytes, stream>>>(
+                args, promoted_phi_in, promoted_phi_out, promoted_ids,
+                promoted_count, promoted_edge, shards_per_cell);
+    else
+        k_update_promoted_sharded_fast_impl<WallCoupling>
+            <<<blocks, kThreads3D, kHaloPipelineBytes, stream>>>(
+                args, promoted_phi_in, promoted_phi_out, promoted_ids,
+                promoted_count, promoted_edge, shards_per_cell);
 }
 
 }  // namespace
 
 cudaError_t configure_tile_kernel_shared_memory() {
-    return set_tile_kernel_smem_limit();
+    // Called during allocation with its device current. Explicit configuration
+    // must not be skipped because this host thread previously used another GPU.
+    return configure_current_tile_kernels();
 }
 
 bool valid_runtime_geometry(int B, const SLayout3D& layout) {
@@ -2259,7 +2672,7 @@ void launch_initialize_spheres(const InitArgs3D& args, cudaStream_t stream) {
         args.cells == nullptr || args.centres == nullptr || args.B <= 0 ||
         args.B % kBrickAlignment != 0 || !(args.lambda > 0.0f) ||
         !(args.seed_radius > 0.0f) ||
-        !valid_runtime_geometry(args.B, args.layout))
+        !valid_runtime_field(args.B, args.layout, args.storage))
         return;
     k_initialize_spheres<<<args.N, kThreads3D, 0, stream>>>(args);
 }
@@ -2273,17 +2686,19 @@ void launch_clear_S(std::uint32_t* S, const SLayout3D& layout,
 }
 
 void launch_scatter_current(const ScatterArgs3D& args, cudaStream_t stream) {
-    if (!valid_runtime_geometry(args.B, args.layout) || args.N <= 0 ||
+    const int count = args.selection.selected_count(args.N);
+    if (!valid_runtime_field(args.B, args.layout, args.storage) || args.N <= 0 ||
+        !args.selection.valid(args.N) || count == 0 ||
         args.phi == nullptr || args.cells == nullptr || args.S == nullptr)
         return;
-    k_scatter_current<<<args.N, kThreads3D, 0, stream>>>(args);
+    k_scatter_current<<<count, kThreads3D, 0, stream>>>(args);
 }
 
 void launch_scatter_promoted(const ScatterArgs3D& args,
                              float* const* promoted_phi,
                              const int* promoted_ids, int promoted_count,
                              int promoted_edge, cudaStream_t stream) {
-    if (!valid_runtime_geometry(promoted_edge, args.layout) || args.N <= 0 ||
+    if (!valid_runtime_field(promoted_edge, args.layout, args.storage) || args.N <= 0 ||
         promoted_phi == nullptr || promoted_ids == nullptr ||
         promoted_count <= 0 || args.cells == nullptr || args.S == nullptr)
         return;
@@ -2291,13 +2706,30 @@ void launch_scatter_promoted(const ScatterArgs3D& args,
         args, promoted_phi, promoted_ids, promoted_count, promoted_edge);
 }
 
+bool launch_check_promoted_crops(
+    float* const* phi, const CellState3D* cells, const int* candidate_edges,
+    std::uint32_t* rejected, int N, int base_edge, cudaStream_t stream,
+    CellFieldStorage3D storage) {
+    std::size_t bytes = 0;
+    if (phi == nullptr || cells == nullptr || candidate_edges == nullptr ||
+        rejected == nullptr || N <= 0 || base_edge <= 0 ||
+        base_edge % kBrickAlignment != 0 || !storage.checked_bytes(base_edge, &bytes))
+        return false;
+    k_check_promoted_crops<<<N, kThreads3D, 0, stream>>>(
+        phi, cells, candidate_edges, rejected, N, base_edge, storage);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 bool launch_measure_cells_only(const MeasureArgs3D& args,
                                cudaStream_t stream) {
-    if (!valid_runtime_geometry(args.B, args.layout) || args.N <= 0 ||
+    if (!args.selection.valid(args.N)) return false;
+    const int count = args.selection.selected_count(args.N);
+    if (!valid_runtime_field(args.B, args.layout, args.storage) || args.N <= 0 ||
         args.phi == nullptr || args.S == nullptr || args.cells == nullptr ||
         !valid_weighted_wall_field(args.wall, args.layout) ||
         ((args.apply_tumble || args.aging_steps != 0u) && args.step == nullptr))
         return false;
+    if (count == 0) return true;
     if (set_tile_kernel_smem_limit() != cudaSuccess) return false;
     const bool wall_coupling = args.layout.hard_wall_channel();
     const bool sharded = args.shards > 1 && args.shards <= 64 &&
@@ -2305,21 +2737,21 @@ bool launch_measure_cells_only(const MeasureArgs3D& args,
     if (sharded) {
         if (wall_coupling)
             k_measure_cell_shards_impl<true>
-                <<<args.N * args.shards, kThreads3D,
+                <<<count * args.shards, kThreads3D,
                    kHaloPipelineBytes, stream>>>(args);
         else
             k_measure_cell_shards_impl<false>
-                <<<args.N * args.shards, kThreads3D,
+                <<<count * args.shards, kThreads3D,
                    kHaloPipelineBytes, stream>>>(args);
-        k_finalize_measure_cell_shards<<<(args.N + 127) / 128,
+        k_finalize_measure_cell_shards<<<(count + 127) / 128,
                                          128, 0, stream>>>(args);
     } else {
         if (wall_coupling)
             k_measure_cells_impl<true>
-                <<<args.N, kThreads3D, kHaloPipelineBytes, stream>>>(args);
+                <<<count, kThreads3D, kHaloPipelineBytes, stream>>>(args);
         else
             k_measure_cells_impl<false>
-                <<<args.N, kThreads3D, kHaloPipelineBytes, stream>>>(args);
+                <<<count, kThreads3D, kHaloPipelineBytes, stream>>>(args);
     }
     return cudaPeekAtLastError() == cudaSuccess;
 }
@@ -2334,7 +2766,7 @@ bool launch_measure_promoted(const MeasureArgs3D& args,
                              float* const* promoted_phi,
                              const int* promoted_ids, int promoted_count,
                              int promoted_edge, cudaStream_t stream) {
-    if (!valid_runtime_geometry(promoted_edge, args.layout) || args.N <= 0 ||
+    if (!valid_runtime_field(promoted_edge, args.layout, args.storage) || args.N <= 0 ||
         promoted_phi == nullptr || promoted_ids == nullptr ||
         promoted_count <= 0 || args.S == nullptr || args.cells == nullptr ||
         !valid_weighted_wall_field(args.wall, args.layout) ||
@@ -2357,15 +2789,21 @@ bool launch_measure_promoted(const MeasureArgs3D& args,
 
 void launch_apply_cell_motion(const MeasureArgs3D& args,
                               cudaStream_t stream) {
+    const int count = args.selection.selected_count(args.N);
     if (args.N <= 0 || args.cells == nullptr || args.global_flags == nullptr ||
+        !args.selection.valid(args.N) || count == 0 ||
         ((args.apply_tumble || args.aging_steps != 0u) && args.step == nullptr))
         return;
-    k_apply_cell_motion<<<(args.N + 127) / 128, 128, 0, stream>>>(args);
+    k_apply_cell_motion<<<(count + 127) / 128, 128, 0, stream>>>(args);
 }
 
 bool launch_update_tiled(const UpdateArgs3D& args, int grid_blocks,
                          cudaStream_t stream) {
-    if (!valid_runtime_geometry(args.B, args.layout) || args.N <= 0 ||
+    if (args.tile_pass != UpdateTilePass3D::All) return false;
+    if (args.N <= 0 || !args.selection.valid(args.N)) return false;
+    const int count = args.selection.selected_count(args.N);
+    if (count == 0) return true;
+    if (!valid_runtime_field(args.B, args.layout, args.storage) || args.N <= 0 ||
         args.phi_in == nullptr || args.phi_out == nullptr ||
         args.phi_in == args.phi_out || args.S_in == nullptr ||
         (args.S_out != nullptr && args.S_out == args.S_in) ||
@@ -2390,24 +2828,28 @@ bool launch_update_tiled_sharded(const UpdateArgs3D& args,
                                  MomentPartial3D* partials,
                                  int shards_per_cell,
                                  cudaStream_t stream) {
+    if (args.tile_pass != UpdateTilePass3D::All) return false;
+    if (args.N <= 0 || !args.selection.valid(args.N)) return false;
+    const int count = args.selection.selected_count(args.N);
+    if (count == 0) return true;
     std::size_t phi_bytes = 0;
     const bool grid_fits = shards_per_cell > 1 &&
         args.N <= std::numeric_limits<int>::max() / shards_per_cell;
-    if (!valid_runtime_geometry(args.B, args.layout) || args.N <= 0 ||
+    if (!valid_runtime_field(args.B, args.layout, args.storage) || args.N <= 0 ||
         args.phi_in == nullptr || args.phi_out == nullptr ||
         args.phi_in == args.phi_out || args.S_in == nullptr ||
         (args.S_out != nullptr && args.S_out == args.S_in) ||
         args.cells == nullptr || args.compute_surface || partials == nullptr ||
         !grid_fits || !valid_weighted_wall_field(args.wall, args.layout) ||
-        !checked_phase_field_bytes(args.N, args.B, 1, &phi_bytes))
+        !checked_stored_field_bytes(args.N, args.B, args.storage, &phi_bytes))
         return false;
 
     if (set_tile_kernel_smem_limit() != cudaSuccess) return false;
-    // Every source voxel maps injectively to phi_out after recentering, so one
-    // device-wide clear is sufficient before the sharded writes.
-    if (cudaMemsetAsync(args.phi_out, 0, phi_bytes, stream) != cudaSuccess)
+    // Recentered writes are disjoint. Clear only the selected destination
+    // cubes when another device owns the remaining cell slots.
+    if (clear_base_output(args, phi_bytes, stream) != cudaSuccess)
         return false;
-    const int blocks = args.N * shards_per_cell;
+    const int blocks = count * shards_per_cell;
     const bool wall_coupling = args.layout.hard_wall_channel();
     if (wall_coupling)
         k_update_tiled_sharded_impl<true>
@@ -2418,14 +2860,18 @@ bool launch_update_tiled_sharded(const UpdateArgs3D& args,
             <<<blocks, kThreads3D, kHaloPipelineBytes, stream>>>(
                 args, partials, shards_per_cell);
     if (cudaPeekAtLastError() != cudaSuccess) return false;
-    k_finalize_tiled_sharded<<<(args.N + 127) / 128, 128, 0, stream>>>(
+    k_finalize_tiled_sharded<<<(count + 127) / 128, 128, 0, stream>>>(
         args, partials, shards_per_cell);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
 bool launch_update_inplace(const UpdateArgs3D& args, float* scratch,
                            int scratch_slots, cudaStream_t stream) {
-    if (!valid_runtime_geometry(args.B, args.layout) || args.N <= 0 ||
+    if (args.tile_pass != UpdateTilePass3D::All) return false;
+    if (args.N <= 0 || !args.selection.valid(args.N)) return false;
+    const int count = args.selection.selected_count(args.N);
+    if (count == 0) return true;
+    if (!valid_runtime_field(args.B, args.layout, args.storage) || args.N <= 0 ||
         args.phi_in == nullptr || scratch == nullptr || scratch_slots <= 0 ||
         scratch == args.phi_in ||
         (args.S_out != nullptr && args.S_out == args.S_in) ||
@@ -2454,7 +2900,8 @@ bool launch_update_promoted(
     float* const* promoted_phi_out, const int* promoted_ids,
     int promoted_count, int promoted_edge, bool collect_moments,
     cudaStream_t stream) {
-    if (!valid_runtime_geometry(promoted_edge, args.layout) || args.N <= 0 ||
+    if (args.tile_pass != UpdateTilePass3D::All) return false;
+    if (!valid_runtime_field(promoted_edge, args.layout, args.storage) || args.N <= 0 ||
         promoted_phi_in == nullptr || promoted_phi_out == nullptr ||
         promoted_phi_in == promoted_phi_out || promoted_ids == nullptr ||
         promoted_count <= 0 || args.S_in == nullptr || args.cells == nullptr ||
@@ -2483,9 +2930,11 @@ bool launch_update_promoted_sharded_fast(
     float* const* promoted_phi_out, const int* promoted_ids,
     int promoted_count, int promoted_edge, int shards_per_cell,
     cudaStream_t stream) {
-    const bool grid_fits = shards_per_cell > 1 &&
+    const bool partial = args.tile_pass != UpdateTilePass3D::All;
+    const bool grid_fits = shards_per_cell >= (partial ? 1 : 2) &&
         promoted_count <= std::numeric_limits<int>::max() / shards_per_cell;
-    if (!valid_runtime_geometry(promoted_edge, args.layout) || args.N <= 0 ||
+    if (!valid_update_partition(args) ||
+        !valid_runtime_field(promoted_edge, args.layout, args.storage) || args.N <= 0 ||
         promoted_phi_in == nullptr || promoted_phi_out == nullptr ||
         promoted_phi_in == promoted_phi_out || promoted_ids == nullptr ||
         promoted_count <= 0 || args.S_in == nullptr || args.cells == nullptr ||
@@ -2494,28 +2943,26 @@ bool launch_update_promoted_sharded_fast(
         !valid_weighted_wall_field(args.wall, args.layout))
         return false;
     if (set_tile_kernel_smem_limit() != cudaSuccess) return false;
-    // Shards skip absent voxels instead of zero-filling, so the destination
-    // cubes are cleared first, mirroring the base sharded launcher's clear
-    // of phi_out.
-    constexpr int kClearBlocksPerCube = 64;
-    k_clear_promoted_out<<<promoted_count * kClearBlocksPerCube, kThreads3D,
-                           0, stream>>>(promoted_phi_out, promoted_ids,
-                                        promoted_count, promoted_edge,
-                                        kClearBlocksPerCube);
-    if (cudaPeekAtLastError() != cudaSuccess) return false;
+    // Interior completes the boundary pass's destination; it must not clear it.
+    if (args.tile_pass != UpdateTilePass3D::Interior) {
+        constexpr int kClearBlocksPerCube = 64;
+        if (promoted_count >
+            std::numeric_limits<int>::max() / kClearBlocksPerCube) return false;
+        k_clear_promoted_out<<<promoted_count * kClearBlocksPerCube, kThreads3D,
+                               0, stream>>>(args, promoted_phi_out, promoted_ids,
+                                            promoted_count, promoted_edge,
+                                            kClearBlocksPerCube);
+        if (cudaPeekAtLastError() != cudaSuccess) return false;
+    }
     const bool wall_coupling = args.layout.hard_wall_channel();
     if (wall_coupling)
-        k_update_promoted_sharded_fast_impl<true>
-            <<<promoted_count * shards_per_cell, kThreads3D,
-               kHaloPipelineBytes, stream>>>(
-                args, promoted_phi_in, promoted_phi_out, promoted_ids,
-                promoted_count, promoted_edge, shards_per_cell);
+        enqueue_promoted_fast_pass<true>(
+            args, promoted_phi_in, promoted_phi_out, promoted_ids,
+            promoted_count, promoted_edge, shards_per_cell, stream);
     else
-        k_update_promoted_sharded_fast_impl<false>
-            <<<promoted_count * shards_per_cell, kThreads3D,
-               kHaloPipelineBytes, stream>>>(
-                args, promoted_phi_in, promoted_phi_out, promoted_ids,
-                promoted_count, promoted_edge, shards_per_cell);
+        enqueue_promoted_fast_pass<false>(
+            args, promoted_phi_in, promoted_phi_out, promoted_ids,
+            promoted_count, promoted_edge, shards_per_cell, stream);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
@@ -2525,7 +2972,7 @@ bool launch_measure_promoted_shards(
     MomentPartial3D* promoted_partials, cudaStream_t stream) {
     const bool grid_fits = args.shards > 1 &&
         promoted_count <= std::numeric_limits<int>::max() / args.shards;
-    if (!valid_runtime_geometry(promoted_edge, args.layout) || args.N <= 0 ||
+    if (!valid_runtime_field(promoted_edge, args.layout, args.storage) || args.N <= 0 ||
         promoted_phi == nullptr || promoted_ids == nullptr ||
         promoted_count <= 0 || args.S == nullptr || args.cells == nullptr ||
         promoted_partials == nullptr || !grid_fits ||
@@ -2571,7 +3018,11 @@ cudaError_t promoted_measure_occupancy(int* blocks_per_sm,
 
 bool launch_update_tiled_fast(const UpdateArgs3D& args, int grid_blocks,
                               cudaStream_t stream) {
-    if (!valid_runtime_geometry(args.B, args.layout) || args.N <= 0 ||
+    if (args.tile_pass != UpdateTilePass3D::All) return false;
+    if (args.N <= 0 || !args.selection.valid(args.N)) return false;
+    const int count = args.selection.selected_count(args.N);
+    if (count == 0) return true;
+    if (!valid_runtime_field(args.B, args.layout, args.storage) || args.N <= 0 ||
         args.phi_in == nullptr || args.phi_out == nullptr ||
         args.phi_in == args.phi_out || args.S_in == nullptr ||
         (args.S_out != nullptr && args.S_out == args.S_in) ||
@@ -2596,35 +3047,41 @@ bool launch_update_tiled_fast(const UpdateArgs3D& args, int grid_blocks,
 bool launch_update_tiled_sharded_fast(const UpdateArgs3D& args,
                                       int shards_per_cell,
                                       cudaStream_t stream) {
+    const bool partial = args.tile_pass != UpdateTilePass3D::All;
+    if (!valid_update_partition(args) || (partial && shards_per_cell < 1)
+        || args.N <= 0 || !args.selection.valid(args.N)) return false;
+    const int count = args.selection.selected_count(args.N);
+    if (count == 0) return true;
     std::size_t phi_bytes = 0;
-    const bool grid_fits = shards_per_cell > 1 &&
+    const bool grid_fits = shards_per_cell >= (partial ? 1 : 2) &&
         args.N <= std::numeric_limits<int>::max() / shards_per_cell;
-    if (!valid_runtime_geometry(args.B, args.layout) || args.N <= 0 ||
+    if (!valid_runtime_field(args.B, args.layout, args.storage) || args.N <= 0 ||
         args.phi_in == nullptr || args.phi_out == nullptr ||
         args.phi_in == args.phi_out || args.S_in == nullptr ||
         (args.S_out != nullptr && args.S_out == args.S_in) ||
         args.cells == nullptr || args.compute_surface || !grid_fits ||
         !valid_weighted_wall_field(args.wall, args.layout) ||
-        !checked_phase_field_bytes(args.N, args.B, 1, &phi_bytes))
+        !checked_stored_field_bytes(args.N, args.B, args.storage, &phi_bytes))
         return false;
     if (set_tile_kernel_smem_limit() != cudaSuccess) return false;
-    if (cudaMemsetAsync(args.phi_out, 0, phi_bytes, stream) != cudaSuccess)
+    if (args.tile_pass != UpdateTilePass3D::Interior
+        && clear_base_output(args, phi_bytes, stream) != cudaSuccess)
         return false;
     const bool wall_coupling = args.layout.hard_wall_channel();
     if (wall_coupling)
-        k_update_tiled_sharded_fast_impl<true>
-            <<<args.N * shards_per_cell, kThreads3D,
-               kHaloPipelineBytes, stream>>>(args, shards_per_cell);
+        enqueue_base_fast_pass<true>(args, count, shards_per_cell, stream);
     else
-        k_update_tiled_sharded_fast_impl<false>
-            <<<args.N * shards_per_cell, kThreads3D,
-               kHaloPipelineBytes, stream>>>(args, shards_per_cell);
+        enqueue_base_fast_pass<false>(args, count, shards_per_cell, stream);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
 bool launch_update_inplace_fast(const UpdateArgs3D& args, float* scratch,
                                 int scratch_slots, cudaStream_t stream) {
-    if (!valid_runtime_geometry(args.B, args.layout) || args.N <= 0 ||
+    if (args.tile_pass != UpdateTilePass3D::All) return false;
+    if (args.N <= 0 || !args.selection.valid(args.N)) return false;
+    const int count = args.selection.selected_count(args.N);
+    if (count == 0) return true;
+    if (!valid_runtime_field(args.B, args.layout, args.storage) || args.N <= 0 ||
         args.phi_in == nullptr || scratch == nullptr || scratch_slots <= 0 ||
         scratch == args.phi_in ||
         (args.S_out != nullptr && args.S_out == args.S_in) ||
@@ -2760,7 +3217,8 @@ cudaError_t sharded_occupancy(int* measurement_blocks_per_sm,
 
 void launch_repair_after_fatal(const UpdateArgs3D& args,
                                cudaStream_t stream) {
-    if (!valid_runtime_geometry(args.B, args.layout) || args.N <= 0 ||
+    if (!valid_runtime_field(args.B, args.layout, args.storage) || args.N <= 0 ||
+        !args.selection.valid(args.N) ||
         args.phi_in == nullptr || args.cells == nullptr ||
         args.global_flags == nullptr)
         return;
@@ -2771,7 +3229,7 @@ void launch_repair_promoted_after_fatal(
     const UpdateArgs3D& args, float* const* promoted_phi_in,
     float* const* promoted_phi_out, const int* promoted_ids,
     int promoted_count, int promoted_edge, cudaStream_t stream) {
-    if (!valid_runtime_geometry(promoted_edge, args.layout) || args.N <= 0 ||
+    if (!valid_runtime_field(promoted_edge, args.layout, args.storage) || args.N <= 0 ||
         promoted_phi_in == nullptr || promoted_phi_out == nullptr ||
         promoted_ids == nullptr || promoted_count <= 0 ||
         args.cells == nullptr || args.global_flags == nullptr)
@@ -2821,35 +3279,37 @@ void launch_measure_wall_diagnostics(const float* phi,
                                  const SLayout3D& layout,
                                  const float* wall_psi_sq,
                                  int channel_height, int channel_padding,
-                                 cudaStream_t stream) {
-    if (!phi || !cells || N <= 0 || B <= 0) return;
+                                 cudaStream_t stream, CellFieldStorage3D storage) {
+    if (!phi || !cells || N <= 0 || !valid_field_storage(storage, B, layout)) return;
     k_measure_wall_diagnostics<<<N, kThreads3D, 0, stream>>>(
         phi, promoted_phi, cells, N, B, layout, wall_psi_sq,
-        channel_height, channel_padding);
+        channel_height, channel_padding, storage);
 }
 
 void launch_verify_cells(const float* phi, const CellState3D* cells,
                          VerifyCell3D* out, int N, int B,
-                         const SLayout3D& layout, cudaStream_t stream) {
+                         const SLayout3D& layout, cudaStream_t stream,
+                         CellFieldStorage3D storage) {
     if (phi == nullptr || cells == nullptr || out == nullptr || N <= 0 ||
-        B <= 0 || B % kBrickAlignment != 0)
+        B <= 0 || B % kBrickAlignment != 0 || !valid_field_storage(storage, B, layout))
         return;
     k_verify_cells<<<N, kThreads3D, 0, stream>>>(
-        phi, cells, out, N, B, layout);
+        phi, cells, out, N, B, layout, storage);
 }
 
 void launch_verify_promoted(float* const* promoted_phi,
                             const CellState3D* cells, VerifyCell3D* out,
                             const int* promoted_ids, int N, int promoted_count,
                             int promoted_edge, const SLayout3D& layout,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, CellFieldStorage3D storage) {
     if (promoted_phi == nullptr || cells == nullptr || out == nullptr ||
         promoted_ids == nullptr || N <= 0 || promoted_count <= 0 ||
-        promoted_edge <= 0 || promoted_edge % kBrickAlignment != 0)
+        promoted_edge <= 0 || promoted_edge % kBrickAlignment != 0 ||
+        !valid_field_storage(storage, promoted_edge, layout))
         return;
     k_verify_promoted<<<promoted_count, kThreads3D, 0, stream>>>(
         promoted_phi, cells, out, promoted_ids, N, promoted_count,
-        promoted_edge, layout);
+        promoted_edge, layout, storage);
 }
 
 void launch_verify_S(const std::uint32_t* S, const SLayout3D& layout,

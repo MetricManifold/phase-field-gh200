@@ -54,8 +54,9 @@ namespace detail {
 __global__ __launch_bounds__(kThreads3D, 3)
 void k_update_periodic_slab_walk_fast(UpdateArgs3D args) {
     extern __shared__ float ring[];  // kSlabRing * kSlabSrcRows * (B+2)
-    const int n = static_cast<int>(blockIdx.x);
-    if (n >= args.N) return;
+    const int slot = static_cast<int>(blockIdx.x);
+    if (slot >= args.selection.selected_count(args.N)) return;
+    const int n = args.selection.cell_index(slot);
     if (cell_is_promoted(args.cells[n], args.B)) return;
     const int B = args.B;
     const std::size_t words = cell_words(B);
@@ -322,9 +323,14 @@ std::size_t update_periodic_slab_walk_shared_bytes(int B) {
 }
 
 bool launch_update_periodic_slab_walk_fast(const UpdateArgs3D& args,
-                                           cudaStream_t stream) {
+                                          cudaStream_t stream) {
+    if (args.tile_pass != UpdateTilePass3D::All) return false;
+    if (args.N <= 0 || !args.selection.valid(args.N)) return false;
+    const int count = args.selection.selected_count(args.N);
+    if (count == 0) return true;
     // This rolling-plane kernel folds z and is therefore fully periodic only.
     if (!args.layout.periodic_xyz() ||
+        !valid_field_storage(args.storage, args.B, args.layout) ||
         !valid_weighted_wall_field(args.wall, args.layout) ||
         !valid_runtime_geometry(args.B, args.layout) || args.N <= 0 ||
         args.phi_in == nullptr || args.phi_out == nullptr ||
@@ -344,7 +350,7 @@ bool launch_update_periodic_slab_walk_fast(const UpdateArgs3D& args,
             return false;
         configured_for = args.B;
     }
-    k_update_periodic_slab_walk_fast<<<args.N, kThreads3D, shared, stream>>>(
+    k_update_periodic_slab_walk_fast<<<count, kThreads3D, shared, stream>>>(
         args);
     return cudaPeekAtLastError() == cudaSuccess;
 }

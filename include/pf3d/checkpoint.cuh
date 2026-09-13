@@ -5,6 +5,7 @@
 
 #include "kernels.cuh"
 #include "params.cuh"
+#include "phase_storage.hpp"
 #include "reduction_mode.hpp"
 
 #include <cuda_runtime.h>
@@ -36,15 +37,17 @@ struct CheckpointMeta3D {
 bool checkpoint_probe_3d(const std::string& path, CheckpointMeta3D* out);
 
 // Load a previously probed payload directly into device storage. Phase data
-// are streamed through bounded host staging memory.
+// are streamed through bounded host staging memory. Compact loads keep only
+// in-domain planes and reject discarded values unless they are finite zero.
 struct CheckpointLoadView3D {
     CellState3D* d_cells = nullptr;
-    // Base-cell payloads use d_phi + cell_index*brick_edge^3.
+    // Base-cell payloads use d_phi + cell_index*storage.words(brick_edge).
     float* d_phi = nullptr;
     // Host pointer table indexed by serialized cell. Required only for cells
     // whose metadata edge exceeds brick_edge.
     float* const* h_promoted_phi = nullptr;
     cudaStream_t stream = nullptr;
+    CellFieldStorage3D storage{};
 };
 
 bool checkpoint_load_3d(const std::string& path,
@@ -72,9 +75,11 @@ struct CheckpointWriteView3D {
     const CellState3D* d_cells = nullptr;
     const float* d_phi = nullptr;
     // Host pointer table indexed like d_cells. A non-null entry supplies the
-    // cube for a cell whose CellState3D::storage_edge exceeds brick_edge.
+    // field for a cell whose CellState3D::storage_edge exceeds brick_edge.
     float* const* h_promoted_phi = nullptr;
     cudaStream_t stream = nullptr;
+    // Device storage may be clipped in z; the file always stores cubic fields.
+    CellFieldStorage3D storage{};
 };
 
 // Write through a unique temporary file and atomically replace the target only
