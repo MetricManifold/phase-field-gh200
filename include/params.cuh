@@ -15,6 +15,7 @@ namespace pf {
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kPhaseFieldMobility = 0.5;
+constexpr double kPhaseFieldM0 = kPhaseFieldMobility;
 
 // Physics: Palmieri et al. 2015, Sci Rep 5:11745, Eq. (S15). Mobility M = 1/2.
 // The coefficient helpers include the mobility factor and return the values
@@ -513,6 +514,8 @@ struct SimParams {
     double gamma_cancer = 0.35;
     double cancer_fraction = 0.0;   // fraction of cells given gamma_cancer
     double v_A_sigma = 0.0;         // lognormal spread on per-cell v_A
+    // Physical Allen-Cahn mobility; M/M0 scales the passive RHS only.
+    double phase_field_mobility = kPhaseFieldM0;
     unsigned long long seed = 1234;
     // Independent stream for initial polarity and tumbles; zero reuses seed.
     // Paired simulations can therefore share reorientation events while using
@@ -587,7 +590,10 @@ static_assert(s_pitch_for(2147483617) == -1,
 
 // Startup validation. Returns false and prints an actionable message rather
 // than asserting, so invalid input cannot silently produce invalid output.
-inline bool validate(const SimParams& p) {
+// resolved_mobility: a per-cell map or checkpoint is in effect, so the resolved
+// per-cell pairs (checked fatally by validate_effective_stiffness) supersede
+// the uniform-mobility interfacial estimate below.
+inline bool validate(const SimParams& p, bool resolved_mobility = false) {
     bool ok = true;
     auto fail = [&](const char* msg) {
         std::fprintf(stderr, "[fatal] %s\n", msg);
@@ -637,6 +643,10 @@ inline bool validate(const SimParams& p) {
         fail("kappa must be finite and non-negative");
     if (!std::isfinite(p.mu) || p.mu < 0.0)
         fail("mu must be finite and non-negative");
+    if (!std::isfinite(p.phase_field_mobility) ||
+        !std::isfinite(static_cast<float>(p.phase_field_mobility)) ||
+        !(static_cast<float>(p.phase_field_mobility) > 0.0f))
+        fail("phase-field mobility must be finite and positive in binary32");
     if (!std::isfinite(p.v_A) || p.v_A < 0.0 ||
         !std::isfinite(p.v_A_sigma) || p.v_A_sigma < 0.0)
         fail("v_A and v_A_sigma must be finite and non-negative");
@@ -670,19 +680,33 @@ inline bool validate(const SimParams& p) {
     }
 
     // Conservative explicit-Euler guard using the Laplacian row-sum bound.
+    // Uniform mobility scales gamma by M/M0. Resolved per-cell pairs are
+    // checked by validate_effective_stiffness before simulation starts.
     const double gmax = p.gamma_normal > p.gamma_cancer ? p.gamma_normal
                                                         : p.gamma_cancer;
-    const double cfl = p.dt * gmax * kLapRowSumBound;
+    const double mrel = p.phase_field_mobility / kPhaseFieldM0;
+    const double cfl = p.dt * gmax * mrel * kLapRowSumBound;
     if (cfl >= 1.0) {
-        std::fprintf(stderr,
-            "[fatal] dt*gamma*laplacian_bound = %.4f; the configured safety "
-            "limit is 1. Reduce dt below %.5g.\n",
-            cfl, 1.0 / (gmax * kLapRowSumBound));
-        ok = false;
+        if (resolved_mobility) {
+            // A map may lower every resolved (M_i/M0)*gamma_i below this
+            // uniform estimate; validate_effective_stiffness remains the
+            // binding, fatal check on the resolved per-cell pairs.
+            std::fprintf(stderr,
+                "[warn] dt*(M/M0)*gamma*laplacian_bound = %.4f exceeds the "
+                "safety limit for the uniform mobility; per-cell values are "
+                "in effect, so the binding check is validate_effective_stiffness "
+                "on the resolved per-cell values.\n", cfl);
+        } else {
+            std::fprintf(stderr,
+                "[fatal] dt*(M/M0)*gamma*laplacian_bound = %.4f; the "
+                "configured safety limit is 1. Reduce dt below %.5g.\n",
+                cfl, 1.0 / (gmax * mrel * kLapRowSumBound));
+            ok = false;
+        }
     } else if (cfl > 0.5) {
         std::fprintf(stderr,
-            "[warn] dt*gamma*laplacian_bound = %.4f; margin to the configured "
-            "safety limit is under 2x.\n", cfl);
+            "[warn] dt*(M/M0)*gamma*laplacian_bound = %.4f; margin to the "
+            "configured safety limit is under 2x.\n", cfl);
     }
 
     // Runtime check that interaction_coeff/motility_coeff equals xi.
@@ -695,6 +719,61 @@ inline bool validate(const SimParams& p) {
         ok = false;
     }
     return ok;
+}
+
+// Explicit-Euler guard over the resolved per-cell values: cell i advances its
+// passive RHS with the effective interfacial coefficient (M_i/M0)*gamma_i, so
+// the check must bound max_i[(M_i/M0)*gamma_i], not max_i[gamma_i]. The
+// mobility also multiplies the area-constraint and overlap-repulsion terms,
+// whose dt margins are audited here as warnings. dt is never changed silently.
+inline bool validate_effective_stiffness(const SimParams& p,
+                                         const float* gamma,
+                                         const float* mobility, int n) {
+    double geff_max = 0.0, mrel_max = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const double g = (double)gamma[i];
+        const double m = (double)mobility[i];
+        if (!(g > 0.0) || !std::isfinite(g) ||
+            !(m > 0.0) || !std::isfinite(m)) {
+            std::fprintf(stderr,
+                "[fatal] cell %d has gamma = %.9g, phase-field mobility = "
+                "%.9g; both must be positive and finite.\n", i, g, m);
+            return false;
+        }
+        const double mrel = m / kPhaseFieldM0;
+        geff_max = std::fmax(geff_max, mrel * g);
+        mrel_max = std::fmax(mrel_max, mrel);
+    }
+    const double cfl = p.dt * geff_max * kLapRowSumBound;
+    if (cfl >= 1.0) {
+        std::fprintf(stderr,
+            "[fatal] max_i[(M_i/M0)*gamma_i] = %.6g gives "
+            "dt*coeff*laplacian_bound = %.4f; the configured safety limit is "
+            "1. Reduce dt below %.5g.\n",
+            geff_max, cfl, 1.0 / (geff_max * kLapRowSumBound));
+        return false;
+    }
+    if (cfl > 0.5)
+        std::fprintf(stderr,
+            "[warn] max_i[(M_i/M0)*gamma_i] = %.6g; dt*coeff*laplacian_bound "
+            "= %.4f leaves under 2x margin to the safety limit.\n",
+            geff_max, cfl);
+    // The overlap term contributes -(M_i/M0)*rep_coeff*phi*S_other to the RHS;
+    // at contact S_other is O(1), so warn when its explicit-Euler margin drops
+    // below 2x. The area term (M_i/M0)*2*mu*(A0-V)/A0 is weaker but shares the
+    // same enlarged multiplier.
+    const double rep_cfl = p.dt * mrel_max * p.interaction();
+    if (rep_cfl > 0.5)
+        std::fprintf(stderr,
+            "[warn] dt*max_i(M_i/M0)*rep_coeff = %.4f; the overlap-repulsion "
+            "term has under 2x explicit-Euler margin at S_other ~ 1. Consider "
+            "reducing dt (it is not changed automatically).\n", rep_cfl);
+    const double vol_cfl = p.dt * mrel_max * p.volume() * p.area0();
+    if (vol_cfl > 0.5)
+        std::fprintf(stderr,
+            "[warn] dt*max_i(M_i/M0)*2*mu = %.4f; the area-constraint term "
+            "has under 2x explicit-Euler margin.\n", vol_cfl);
+    return true;
 }
 
 inline void print_params(const SimParams& p, int side, int pitch) {
@@ -712,6 +791,9 @@ inline void print_params(const SimParams& p, int side, int pitch) {
     std::printf("  kappa, mu, xi    %.6g, %.6g, %.6g\n", p.kappa, p.mu, p.xi);
     std::printf("  gamma n/c        %.6g / %.6g  (cancer fraction %.4g)\n",
                 p.gamma_normal, p.gamma_cancer, p.cancer_fraction);
+    std::printf("  phase-field M    %.6g  (M/M0 = %.6g; per-cell via map or "
+                "MOBI sidecar)\n",
+                p.phase_field_mobility, p.phase_field_mobility / kPhaseFieldM0);
     std::printf("  v_A, tau         %.6g, %.6g\n", p.v_A, p.tau);
     std::printf("  A0               %.6f\n", p.area0());
     std::printf("  bulk  30/lambda^2             %.9g\n", p.bulk());

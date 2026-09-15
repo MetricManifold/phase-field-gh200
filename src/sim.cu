@@ -81,10 +81,11 @@ Sim::~Sim() {
 // use the default grid-and-jitter layout.
 bool Sim::seed_positions(std::vector<float>& cx, std::vector<float>& cy,
                          std::vector<float>& gam, std::vector<float>& va,
-                         std::vector<int32_t>& gid)
+                         std::vector<float>& mob, std::vector<int32_t>& gid)
 {
     const int N = p_.num_cells;
-    cx.resize(N); cy.resize(N); gam.resize(N); va.resize(N); gid.resize(N);
+    cx.resize(N); cy.resize(N); gam.resize(N); va.resize(N); mob.resize(N);
+    gid.resize(N);
 
     if (!opt_.initial_centres_path.empty()) {
         PalmieriCentresCsvDiagnostics diag{};
@@ -140,6 +141,16 @@ bool Sim::seed_positions(std::vector<float>& cx, std::vector<float>& cy,
         va[(std::size_t)i] =
             (float)ic_v_A(i, p_.seed, p_.v_A, p_.v_A_sigma);
         gid[(std::size_t)i] = i;
+    }
+
+    // Uniform phase-field mobility plus validated per-cell map overrides.
+    std::string mob_err;
+    if (!apply_phase_field_mobility(opt_.phase_field_mobility_map,
+                                    p_.phase_field_mobility, gid.data(), N,
+                                    mob.data(), &mob_err)) {
+        std::fprintf(stderr, "[fatal] phase-field mobility: %s\n",
+                     mob_err.c_str());
+        return false;
     }
     return true;
 }
@@ -299,9 +310,11 @@ bool Sim::init(const SimParams& p, const RunOptions& opt, int device) {
     p_ = p;
     opt_ = opt;
     side_ = p.Nx;
-    std::vector<float> cx, cy, gam, va;
+    std::vector<float> cx, cy, gam, va, mob;
     std::vector<int32_t> gid;
-    if (!seed_positions(cx, cy, gam, va, gid)) return false;
+    if (!seed_positions(cx, cy, gam, va, mob, gid)) return false;
+    if (!validate_effective_stiffness(p_, gam.data(), mob.data(), p_.num_cells))
+        return false;
 
     const SimParams initialized_params = p_;
     if (!alloc_device(initialized_params, opt, device)) return false;
@@ -317,6 +330,7 @@ bool Sim::init(const SimParams& p, const RunOptions& opt, int device) {
         c.global_id = gid[i];
         c.gamma = gam[i];
         c.v_A   = va[i];
+        c.M_pf  = mob[i];
         c.R_tgt = (float)p_.target_radius;
         c.theta = ic_theta(gid[i], p_.polarity_stream());
         c.cls = (uint8_t)kClassRound;
@@ -375,6 +389,14 @@ bool Sim::init_from_checkpoint(const SimParams& p, const CheckpointData& d,
         std::fprintf(stderr, "[ckpt] negative step %lld\n", d.step);
         return false;
     }
+    std::vector<float> gamma(static_cast<size_t>(d.n));
+    std::vector<float> mobility(static_cast<size_t>(d.n));
+    for (int i = 0; i < d.n; ++i) {
+        gamma[static_cast<size_t>(i)] = d.cells[static_cast<size_t>(i)].gamma;
+        mobility[static_cast<size_t>(i)] = d.cells[static_cast<size_t>(i)].M_pf;
+    }
+    if (!validate_effective_stiffness(p, gamma.data(), mobility.data(), d.n))
+        return false;
     if (p.total_steps() < d.step) {
         std::fprintf(stderr,
             "[ckpt] requested t_end ends at step %lld, before checkpoint "
@@ -401,6 +423,7 @@ bool Sim::init_from_checkpoint(const SimParams& p, const CheckpointData& d,
         c.gy0 = s.origin[1];
         c.gamma = s.gamma;
         c.v_A   = s.v_A;
+        c.M_pf  = s.M_pf;
         c.R_tgt = s.R_tgt;
         c.theta = s.theta;
         c.vx = s.vx;

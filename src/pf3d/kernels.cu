@@ -135,7 +135,7 @@ __device__ __forceinline__ bool load_halo(const float* tile, int B,
              static_cast<unsigned>(y) < static_cast<unsigned>(B) &&
              phase_fetch_local_z(layout, origin_z, z, B, &source_z))
                 ? tile[storage.index(x, y, source_z, B, origin_z)] : 0.0f;
-        shared_phi[q] = value;
+        shared_phi[(hz * kHaloY + hy) * kHaloRowStride + hx] = value;
         any_nonzero = any_nonzero || value != 0.0f;
     }
     // The phase equation leaves an all-zero halo exactly zero. Skipping its
@@ -145,7 +145,7 @@ __device__ __forceinline__ bool load_halo(const float* tile, int B,
 }
 
 __device__ __forceinline__ int halo_index(int x, int y, int z) {
-    return (z * kHaloY + y) * kHaloX + x;
+    return (z * kHaloY + y) * kHaloRowStride + x;
 }
 
 __device__ __forceinline__ void stencil27(const float* shared_phi,
@@ -268,35 +268,47 @@ __device__ __forceinline__ void prefetch_halo(const float* tile, int B,
     const int x0 = tx * kBrickX - 1;
     const int y0 = ty * kBrickY - 1;
     const int z0 = tz * kBrickZ - 1;
-    const int first = static_cast<int>(threadIdx.x);
-    int hx = first % kHaloX;
-    int hy = (first / kHaloX) % kHaloY;
-    int hz = first / (kHaloX * kHaloY);
-    // Advance the same strided voxel sequence using row/plane carries.
-    constexpr int step_x = kThreads3D % kHaloX;
-    constexpr int step_y = (kThreads3D / kHaloX) % kHaloY;
-    constexpr int step_z = kThreads3D / (kHaloX * kHaloY);
-    for (int q = static_cast<int>(threadIdx.x); q < kHaloVoxels;
-         q += kThreads3D) {
+    constexpr int vectors_per_row = kBrickX / 4;
+    constexpr int halo_rows = kHaloY * kHaloZ;
+    for (int q = static_cast<int>(threadIdx.x);
+         q < halo_rows * vectors_per_row; q += kThreads3D) {
+        const int row = q / vectors_per_row;
+        const int hx = 1 + 4 * (q % vectors_per_row);
         const int x = x0 + hx;
-        const int y = y0 + hy;
-        const int z = z0 + hz;
+        const int y = y0 + row % kHaloY;
+        const int z = z0 + row / kHaloY;
+        float* const destination = shared_buf + row * kHaloRowStride + hx;
+        int source_z = 0;
+        if (static_cast<unsigned>(x) < static_cast<unsigned>(B) &&
+            x + 3 < B &&
+            static_cast<unsigned>(y) < static_cast<unsigned>(B) &&
+            fetch_z(z, &source_z)) {
+            __pipeline_memcpy_async(destination,
+                &tile[local_index(x, y, source_z + storage_z_offset, B)],
+                sizeof(float4));
+        } else {
+            *reinterpret_cast<float4*>(destination) = make_float4(0, 0, 0, 0);
+        }
+    }
+    // Ghost columns keep the same source/reflection rules as the scalar loader.
+    for (int q = static_cast<int>(threadIdx.x); q < 2 * halo_rows;
+         q += kThreads3D) {
+        const int row = q / 2;
+        const int hx = (q % 2) * (kHaloX - 1);
+        const int x = x0 + hx;
+        const int y = y0 + row % kHaloY;
+        const int z = z0 + row / kHaloY;
+        float* const destination = shared_buf + row * kHaloRowStride + hx;
         int source_z = 0;
         if (static_cast<unsigned>(x) < static_cast<unsigned>(B) &&
             static_cast<unsigned>(y) < static_cast<unsigned>(B) &&
             fetch_z(z, &source_z)) {
-            __pipeline_memcpy_async(&shared_buf[q],
-                                    &tile[local_index(x, y,
-                                           source_z + storage_z_offset, B)],
-                                    sizeof(float));
+            __pipeline_memcpy_async(destination,
+                &tile[local_index(x, y, source_z + storage_z_offset, B)],
+                sizeof(float));
         } else {
-            shared_buf[q] = 0.0f;
+            *destination = 0.0f;
         }
-        hx += step_x;
-        hy += step_y;
-        hz += step_z;
-        if (hx >= kHaloX) { hx -= kHaloX; ++hy; }
-        if (hy >= kHaloY) { hy -= kHaloY; ++hz; }
     }
     __pipeline_commit();
 }
@@ -318,13 +330,25 @@ __device__ __forceinline__ void prefetch_halo(const float* tile, int B,
 
 // The phase equation leaves an all-zero halo exactly zero, so skipping such a
 // tile's stencil work is bitwise neutral; NaN also compares nonzero and stays
-// visible to the integrity checks.  Includes the barrier that publishes the
-// waited-on asynchronous copies to the whole CTA.
+// visible to the integrity checks. Each thread scans only words it staged and
+// waited on; the final collective publishes all copies before stencil reads.
 __device__ __forceinline__ bool halo_any_nonzero(const float* shared_buf) {
     bool any = false;
-    for (int q = static_cast<int>(threadIdx.x); q < kHaloVoxels;
-         q += kThreads3D)
-        any = any || shared_buf[q] != 0.0f;
+    // Match prefetch_halo's float4-interior and scalar-ghost thread ownership.
+    constexpr int rows = kHaloY * kHaloZ, vectors_per_row = kBrickX / 4;
+    for (int q = static_cast<int>(threadIdx.x); q < rows * vectors_per_row;
+         q += kThreads3D) {
+        const int row = q / vectors_per_row, hx = 1 + 4 * (q % vectors_per_row);
+        const float4 v = *reinterpret_cast<const float4*>(
+            shared_buf + row * kHaloRowStride + hx);
+        // Floating comparisons treat signed zero as zero and keep NaN visible.
+        any = any || ((v.x != 0.0f) | (v.y != 0.0f)
+                    | (v.z != 0.0f) | (v.w != 0.0f));
+    }
+    for (int q = static_cast<int>(threadIdx.x); q < 2 * rows; q += kThreads3D) {
+        const int row = q / 2, hx = (q % 2) * (kHaloX - 1);
+        any = any || shared_buf[row * kHaloRowStride + hx] != 0.0f;
+    }
     return __syncthreads_or(any ? 1 : 0) != 0;
 }
 
@@ -582,8 +606,8 @@ __device__ void process_update_cell(int n, const UpdateArgs3D& args,
     const int tiles_per_plane = tiles_x * tiles_y;
     const int tile_begin = tz_begin * tiles_per_plane;
     const int tile_end = tz_end * tiles_per_plane;
-    float* const halo0 = halo_pair;
-    float* const halo1 = halo_pair + kHaloVoxels;
+    float* const halo0 = halo_pair + kHaloLeadingPadding;
+    float* const halo1 = halo0 + kHaloBufferWords;
     int parity = 0;
     if (tile_begin < tile_end)
         prefetch_halo(source, B, tile_begin, tiles_x, tiles_y, args.layout,
@@ -875,8 +899,8 @@ __device__ void process_update_shard(int n, int shard, int shards_per_cell,
                 + (shard - begin_remainder + shards_per_cell) % shards_per_cell,
             tile_end, shards_per_cell, tiles_x, tiles_per_plane, B,
             args, origin_y, state->origin_z);
-        float* const halo0 = halo_pair;
-        float* const halo1 = halo_pair + kHaloVoxels;
+        float* const halo0 = halo_pair + kHaloLeadingPadding;
+        float* const halo1 = halo0 + kHaloBufferWords;
         int parity = 0;
         if (first_tile < tile_end)
             prefetch_halo(source, B, first_tile, tiles_x, tiles_y,
@@ -1279,8 +1303,8 @@ __device__ void measure_one_cell(const MeasureArgs3D& args, int n, int B,
     const int tiles_per_plane = tiles_x * tiles_y;
     const int tile_begin = tz_begin * tiles_per_plane;
     const int tile_end = tz_end * tiles_per_plane;
-    float* const halo0 = halo_pair;
-    float* const halo1 = halo_pair + kHaloVoxels;
+    float* const halo0 = halo_pair + kHaloLeadingPadding;
+    float* const halo1 = halo0 + kHaloBufferWords;
     int parity = 0;
     if (tile_begin < tile_end)
         prefetch_halo(tile, B, tile_begin, tiles_x, tiles_y, fetch_z,
@@ -1372,7 +1396,7 @@ __device__ void measure_one_cell(const MeasureArgs3D& args, int n, int B,
 template <bool WallCoupling>
 __global__ __launch_bounds__(kThreads3D, 3)
 void k_measure_cells_impl(MeasureArgs3D args) {
-    extern __shared__ float halo_pair[];
+    extern __shared__ __align__(16) float halo_pair[];
     __shared__ Reduction3D warp_values[kWarps3D];
     const int slot = static_cast<int>(blockIdx.x);
     if (slot >= args.selection.selected_count(args.N)) return;
@@ -1390,7 +1414,7 @@ void k_measure_promoted_impl(MeasureArgs3D args,
                              float* const* promoted_phi,
                              const int* promoted_ids,
                              int promoted_count, int promoted_edge) {
-    extern __shared__ float halo_pair[];
+    extern __shared__ __align__(16) float halo_pair[];
     __shared__ Reduction3D warp_values[kWarps3D];
     const int slot = static_cast<int>(blockIdx.x);
     if (slot >= promoted_count) return;
@@ -1415,7 +1439,7 @@ void k_measure_promoted_shards_impl(MeasureArgs3D args,
                                     const int* promoted_ids,
                                     int promoted_count, int promoted_edge,
                                     MomentPartial3D* promoted_partials) {
-    extern __shared__ float halo_pair[];
+    extern __shared__ __align__(16) float halo_pair[];
     __shared__ Reduction3D warp_values[kWarps3D];
     const int block = static_cast<int>(blockIdx.x);
     const int slot = block / args.shards;
@@ -1456,8 +1480,8 @@ void k_measure_promoted_shards_impl(MeasureArgs3D args,
     const int begin_remainder = brick_begin % args.shards;
     const int first_brick = brick_begin
         + (shard - begin_remainder + args.shards) % args.shards;
-    float* const halo0 = halo_pair;
-    float* const halo1 = halo_pair + kHaloVoxels;
+    float* const halo0 = halo_pair + kHaloLeadingPadding;
+    float* const halo1 = halo0 + kHaloBufferWords;
     int parity = 0;
     if (first_brick < brick_end)
         prefetch_halo(tile, B, first_brick, bricks_x, bricks_y, fetch_z,
@@ -1567,7 +1591,7 @@ __global__ void k_finalize_measure_promoted(
 template <bool WallCoupling>
 __global__ __launch_bounds__(kThreads3D, 3)
 void k_measure_cell_shards_impl(MeasureArgs3D args) {
-    extern __shared__ float halo_pair[];
+    extern __shared__ __align__(16) float halo_pair[];
     __shared__ Reduction3D warp_values[kWarps3D];
     const int block = static_cast<int>(blockIdx.x);
     const int slot = block / args.shards;
@@ -1609,8 +1633,8 @@ void k_measure_cell_shards_impl(MeasureArgs3D args) {
     const int begin_remainder = brick_begin % args.shards;
     const int first_brick = brick_begin
         + (shard - begin_remainder + args.shards) % args.shards;
-    float* const halo0 = halo_pair;
-    float* const halo1 = halo_pair + kHaloVoxels;
+    float* const halo0 = halo_pair + kHaloLeadingPadding;
+    float* const halo1 = halo0 + kHaloBufferWords;
     int parity = 0;
     if (first_brick < brick_end)
         prefetch_halo(tile, B, first_brick, bricks_x, bricks_y, fetch_z,
@@ -1766,7 +1790,7 @@ __global__ void k_apply_cell_motion(MeasureArgs3D args) {
 template <bool WallCoupling>
 __global__ __launch_bounds__(kThreads3D, 1)
 void k_update_tiled_impl(UpdateArgs3D args) {
-    extern __shared__ float halo_pair[];
+    extern __shared__ __align__(16) float halo_pair[];
     __shared__ Reduction3D warp_values[kWarps3D];
     __shared__ int cell_number;
 
@@ -1794,7 +1818,7 @@ void k_update_tiled_impl(UpdateArgs3D args) {
 template <bool WallCoupling>
 __global__ __launch_bounds__(kThreads3D, 4)
 void k_update_tiled_fast_impl(UpdateArgs3D args) {
-    extern __shared__ float halo_pair[];
+    extern __shared__ __align__(16) float halo_pair[];
     __shared__ int cell_number;
     __shared__ int abort_flag;
 
@@ -1824,7 +1848,7 @@ __global__ __launch_bounds__(kThreads3D, 1)
 void k_update_tiled_sharded_impl(UpdateArgs3D args,
                                  MomentPartial3D* partials,
                                  int shards_per_cell) {
-    extern __shared__ float halo_pair[];
+    extern __shared__ __align__(16) float halo_pair[];
     __shared__ Reduction3D warp_values[kWarps3D];
     __shared__ int abort_flag;
     const int block = static_cast<int>(blockIdx.x);
@@ -1845,7 +1869,7 @@ template <bool WallCoupling, UpdateTilePass3D Pass = UpdateTilePass3D::All>
 __global__ __launch_bounds__(kThreads3D, 3)
 void k_update_tiled_sharded_fast_impl(UpdateArgs3D args,
                                       int shards_per_cell) {
-    extern __shared__ float halo_pair[];
+    extern __shared__ __align__(16) float halo_pair[];
     __shared__ int abort_flag;
     const int block = static_cast<int>(blockIdx.x);
     const int slot = block / shards_per_cell;
@@ -1897,7 +1921,7 @@ void k_update_promoted_sharded_fast_impl(
     UpdateArgs3D args, float* const* promoted_phi_in,
     float* const* promoted_phi_out, const int* promoted_ids,
     int promoted_count, int promoted_edge, int shards_per_cell) {
-    extern __shared__ float halo_pair[];
+    extern __shared__ __align__(16) float halo_pair[];
     __shared__ int abort_flag;
     const int block = static_cast<int>(blockIdx.x);
     const int slot = block / shards_per_cell;
@@ -1974,7 +1998,7 @@ __global__ __launch_bounds__(kThreads3D, 1)
 void k_update_inplace_impl(UpdateArgs3D args, float* scratch,
                            int scratch_slots) {
     if (static_cast<int>(blockIdx.x) >= scratch_slots) return;
-    extern __shared__ float halo_pair[];
+    extern __shared__ __align__(16) float halo_pair[];
     __shared__ Reduction3D warp_values[kWarps3D];
     __shared__ int cell_number;
     const std::size_t words = stored_cell_words(args.B, args.storage);
@@ -2026,7 +2050,7 @@ __global__ __launch_bounds__(kThreads3D, 4)
 void k_update_inplace_fast_impl(UpdateArgs3D args, float* scratch,
                                 int scratch_slots) {
     if (static_cast<int>(blockIdx.x) >= scratch_slots) return;
-    extern __shared__ float halo_pair[];
+    extern __shared__ __align__(16) float halo_pair[];
     __shared__ int cell_number;
     __shared__ int abort_flag;
     const std::size_t words = stored_cell_words(args.B, args.storage);
@@ -2078,7 +2102,7 @@ void k_update_promoted_impl(UpdateArgs3D args,
                             const int* promoted_ids,
                             int promoted_count, int promoted_edge,
                             bool collect_moments) {
-    extern __shared__ float halo_pair[];
+    extern __shared__ __align__(16) float halo_pair[];
     __shared__ Reduction3D warp_values[kWarps3D];
     __shared__ int abort_flag;
     const int slot = static_cast<int>(blockIdx.x);

@@ -78,6 +78,7 @@ __global__ void observe(StepArgs A, MomentAccum* out, double physical_dt) {
     const double cx = c.Cx / c.V, cy = c.Cy / c.V;
     const double dw = (double)(A.bulk_scale * c.gamma);
     const double vol = (double)(float)(A.vol_scale * (A.A0 - c.V));
+    const double mobility = (double)(c.M_pf / (float)kPhaseFieldM0);
     // The continuum components use these same rounded model coefficients,
     // but their variational arithmetic and moments are evaluated in double.
     const double vx = (double)(float)(velocity[0] + velocity[2]);
@@ -93,8 +94,12 @@ __global__ void observe(StepArgs A, MomentAccum* out, double physical_dt) {
         const double lap = (4. * (nn + s + e + w) + ne + nw + se + sw - 20. * p) / 6.;
         const double gx = .5 * (e - w), gy = .5 * (nn - s);
         const double so = (double)other_at(A, c, x, y, (float)p);
-        const double source[4] = {(double)c.gamma * lap - dw * p * (1. - p) * (1. - 2. * p),
+        double source[4] = {(double)c.gamma * lap - dw * p * (1. - p) * (1. - 2. * p),
                                   -(double)A.rep_coeff * p * so, vol * p, -(vx * gx + vy * gy)};
+        // Mobility scales the passive variational terms, never advection.
+        if (mobility != 1.)
+            for (int j = 0; j < 3; ++j)
+                source[j] *= mobility;
         const double wx = 2. * ((double)x - cx) * p / c.V;
         const double wy = 2. * ((double)y - cy) * p / c.V;
 #pragma unroll

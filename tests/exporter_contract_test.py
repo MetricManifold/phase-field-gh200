@@ -77,6 +77,24 @@ def main() -> int:
         assert parameters["polarity_seed"] == 0xFEDCBA9876543210
         assert parameters["soft_fraction"] == 0.5
         assert parameters["trajectory_interval"] == 5
+        assert parameters["per_cell_sidecars"]["mobility"]["minimum"] == 0.5
+
+        # Optional per-cell mobility affects preparation dynamics, not which
+        # exact centroid coordinates this position-only transfer exports.
+        mobility_checkpoint = root / "mobility.bin"
+        mobility_checkpoint.write_bytes(checkpoint.read_bytes() +
+                                        struct.pack("<Ii2f", 0x4D4F4249, 2, 0.7, 1.25))
+        mobility_csv = root / "mobility.csv"
+        mobility_meta = run_export(args.exporter, "--checkpoint", mobility_checkpoint, mobility_csv)
+        assert_centres(mobility_csv)
+        mobility = mobility_meta["source"]["parameters"]["per_cell_sidecars"]["mobility"]
+        assert mobility["minimum"] == struct.unpack("<f", struct.pack("<f", 0.7))[0]
+        assert mobility["maximum"] == 1.25 and mobility["transferred_to_3d"] is False
+        bad_mobility = root / "bad-mobility.bin"
+        bad_mobility.write_bytes(checkpoint.read_bytes() +
+                                struct.pack("<Ii2f", 0x4D4F4249, 2, 0.5, 0.0))
+        expect_checkpoint_rejected(args.exporter, bad_mobility, root / "bad-mobility.csv",
+                                   "phase-field mobility must be positive")
 
         corrupt_centroid = root / "corrupt-centroid.bin"
         corrupt_bytes = bytearray(checkpoint.read_bytes())

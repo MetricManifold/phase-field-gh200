@@ -39,6 +39,9 @@ static void usage(const char* argv0) {
 "  --gamma <f>            gamma for normal cells             (1.0)\n"
 "  --gamma-cancer <f>     gamma for cancer cells             (0.35)\n"
 "  --cancer-fraction <f>  lowest-ID fraction given the soft gamma (0)\n"
+"  --phase-field-mobility <f>  uniform passive Allen-Cahn mobility (0.5)\n"
+"                         M_i/0.5 scales passive dphi/dt, not advection/velocity\n"
+"  --phase-field-mobility-map <path>  per-cell 'global_id value' overrides\n"
 "\n"
 "numerics / run control\n"
 "  --dt <f>               time step                          (0.01)\n"
@@ -77,6 +80,10 @@ static void usage(const char* argv0) {
 "  -c, --checkpoint <path>     resume from a checkpoint; explicitly supplied\n"
 "                              options override stored parameters. --N and\n"
 "                              --rho cannot change on resume.\n"
+"                              Mobility: uniform rebases all cells, then map\n"
+"                              overrides; map alone overlays stored values;\n"
+"                              with neither flag, stored values are kept\n"
+"                              (absent MOBI means 0.5).\n"
 "  --checkpoint-interval <int> steps between rolling <dir>/checkpoint.bin\n"
 "                              (overwritten in place, atomically)\n"
 "  --save-interval <int>       steps between tagged <dir>/checkpoint_%%08d.bin\n"
@@ -323,6 +330,7 @@ int main(int argc, char** argv) {
     bool self_test = false;
     std::string ckpt_in;
     std::string ckpt_dir_flag;
+    std::string mobility_map_path;
     bool no_final_ckpt = false;
     bool trajectory_samples_supplied = false;
     bool trajectory_interval_supplied = false;
@@ -382,6 +390,15 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(a, "--cancer-fraction")) {
             if (!parse_d(a, need(), &p.cancer_fraction, 0.0, 1.0)) return 2;
             ov.cancer_fraction = true;
+        } else if (!std::strcmp(a, "--phase-field-mobility")) {
+            if (!parse_d(a, need(), &p.phase_field_mobility, 1e-9, 1e6)) return 2;
+            ov.phase_field_mobility = true;
+        } else if (!std::strcmp(a, "--phase-field-mobility-map")) {
+            mobility_map_path = need();
+            if (mobility_map_path.empty()) {
+                std::fprintf(stderr, "[fatal] mobility map path is empty\n");
+                return 2;
+            }
         } else if (!std::strcmp(a, "--dt")) {
             if (!parse_d(a, need(), &p.dt, 1e-12, 1e6)) return 2;
             ov.dt = true;
@@ -502,6 +519,17 @@ int main(int argc, char** argv) {
     if (!distinct_output_paths({opt.out_path, opt.boundary_path, opt.velocity.path}))
         return 2;
     // Load a stored state or construct a fresh initial condition.
+    if (!mobility_map_path.empty()) {
+        std::string error;
+        if (!read_phase_field_mobility_map(mobility_map_path,
+                                           &opt.phase_field_mobility_map,
+                                           &error)) {
+            std::fprintf(stderr, "[fatal] phase-field mobility map: %s\n",
+                         error.c_str());
+            return 2;
+        }
+        opt.phase_field_mobility_map_given = true;
+    }
     CheckpointData ckpt;
     if (!ckpt_in.empty()) {
         if (!opt.initial_centres_path.empty()) {
@@ -527,12 +555,18 @@ int main(int argc, char** argv) {
         p = ckpt.params;
         ov.apply(p, cli);
         resolve_per_cell_scalars(p, ov, &ckpt);
+        // Resolve explicit mobility overrides before validating per-cell stiffness.
+        if (!resolve_phase_field_mobility(p, ov, opt.phase_field_mobility_map,
+                                          opt.phase_field_mobility_map_given,
+                                          &ckpt))
+            return 2;
     } else {
         // The domain is square by construction: L = ceil(sqrt(N*A0/rho)).
         p.Nx = p.Ny = domain_side_for(p.num_cells, p.target_radius, p.rho);
     }
 
-    if (!validate(p)) return 3;
+    // Resolved checkpoint pairs, not the default uniform, bind a restart.
+    if (!validate(p, opt.phase_field_mobility_map_given || !ckpt_in.empty())) return 3;
     const int pitch = s_pitch_for(p.Nx);
     print_params(p, p.Nx, pitch);
 

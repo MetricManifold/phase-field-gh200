@@ -10,6 +10,7 @@
 #include "checkpoint_format.h"
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace pf {
@@ -23,6 +24,7 @@ struct SimOverrides {
     bool gamma = false, gamma_cancer = false, cancer_fraction = false;
     bool kappa = false, mu = false, xi = false, lambda = false;
     bool target_radius = false, v_A_sigma = false;
+    bool phase_field_mobility = false;
     bool seed = false, polarity_seed = false;
     bool print_interval = false, full_moment = false;
     bool verify_every = false;
@@ -48,6 +50,7 @@ struct CkptCell {
     uint8_t cls   = 0;
     float   gamma = 0.0f, v_A = 0.0f, R_tgt = 0.0f, theta = 0.0f;
     float   vx = 0.0f, vy = 0.0f;
+    float   M_pf = static_cast<float>(kPhaseFieldM0);
     double  volume_moment = 0.0, moment_x = 0.0, moment_y = 0.0;
     double  perimeter = 0.0;
     int32_t support_lo_x = 0, support_hi_x = -1;
@@ -63,6 +66,7 @@ struct CheckpointData {
     int       n       = 0;
     int       file_tile_pitch = 0;
     int32_t   num_ranks = 1, rank_id = 0, n_global = 0;
+    bool      had_mobi = false;
     int       trajectory_samples = 0;
     long long trajectory_interval = 0;
     std::vector<CkptCell> cells;      // n entries
@@ -77,6 +81,47 @@ bool checkpoint_read(const std::string& path, CheckpointData* out);
 // requested run has nonzero activity.
 void resolve_per_cell_scalars(const SimParams& p, const SimOverrides& ov,
                               CheckpointData* d);
+
+// Strictly validated per-cell phase-field mobility overrides, keyed by global
+// cell id. Ids are unique; every value is finite and positive as a float.
+struct PhaseFieldMobilityMap {
+    std::vector<std::pair<int32_t, float>> entries;
+};
+
+// Parse one "global_id value" pair per line ('#' comments and blank lines are
+// permitted). Any malformed row, non-finite or non-positive value, or
+// duplicate id fails with a message; membership of the ids in the simulation
+// is checked by the apply/overlay functions below before the run starts.
+bool read_phase_field_mobility_map(const std::string& path,
+                                   PhaseFieldMobilityMap* out,
+                                   std::string* error);
+
+// Fill out[i] with the uniform mobility, then apply map entries by global id.
+// An id absent from gid[0..n), or duplicated within gid, fails with a message.
+bool apply_phase_field_mobility(const PhaseFieldMobilityMap& map,
+                                double uniform, const int32_t* gid, int n,
+                                float* out, std::string* error);
+
+// Apply map entries by global id on top of the existing values in inout,
+// leaving unlisted cells untouched. Same id checks as above.
+bool overlay_phase_field_mobility(const PhaseFieldMobilityMap& map,
+                                  const int32_t* gid, int n,
+                                  float* inout, std::string* error);
+
+// Resume-time precedence, in exactly three cases:
+//   1. --phase-field-mobility given (with or without a map): every cell is
+//      rebased to that uniform value and map entries then override their ids.
+//   2. only --phase-field-mobility-map given: map entries override their ids
+//      ON TOP of the existing per-cell values (stored MOBI, or the all-0.5
+//      fill of a pre-MOBI checkpoint); unlisted cells keep those values. The
+//      current parameter record does not store the writing run's uniform
+//      mobility (unlike gamma), so a map-only resume must never rebase
+//      unlisted cells to the compiled default.
+//   3. neither flag: stored MOBI values are kept; a checkpoint without MOBI
+//      loads with M_i = 0.5 for every cell.
+bool resolve_phase_field_mobility(const SimParams& p, const SimOverrides& ov,
+                                  const PhaseFieldMobilityMap& map,
+                                  bool map_given, CheckpointData* d);
 
 // Non-owning state passed to the writer. d_phi is a device pointer; the caller
 // must synchronize its producing stream. Bounded staging keeps host memory

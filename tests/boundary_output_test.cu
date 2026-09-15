@@ -74,7 +74,7 @@ void verify(const std::filesystem::path& path, const pf::SimParams& p,
             const int ox = ((c.gx0-sc.tx0)%p.Nx+p.Nx)%p.Nx;
             const int oy = ((c.gy0-sc.ty0)%p.Ny+p.Ny)%p.Ny;
             require(m.id == c.global_id && m.origin_x == ox && m.origin_y == oy &&
-                    m.gamma == c.gamma && m.mobility == 0.5f &&
+                    m.gamma == c.gamma && m.mobility == c.M_pf &&
                     m.active_speed == c.v_A && m.radius == c.R_tgt &&
                     m.squares == expected[i].size(), "cell metadata and periodic tile origin");
             require(m.cx >= 0 && m.cx < p.Nx && m.cy >= 0 && m.cy < p.Ny,
@@ -118,6 +118,7 @@ int main() {
             c.gx0 = i%2 ? 549 : 0; c.gy0 = i%3 ? 549 : 0;
             c.V = 1; c.Cx = 2; c.Cy = 3;
             c.gamma = i%2 ? 0.35f : 1.f; c.R_tgt = 49; c.v_A = 0.01f;
+            c.M_pf = i%2 ? 0.75f : 0.5f;
             float* tile = phi.data()+size_t(i)*pf::kTileArea;
             for (int y = 64; y < 210; ++y)
                 for (int x = 64; x < 210; ++x)

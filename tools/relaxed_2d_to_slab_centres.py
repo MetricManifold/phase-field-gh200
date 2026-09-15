@@ -38,9 +38,11 @@ MAGIC_VA_A = 0x56415F41
 MAGIC_GAMA = 0x47414D41
 MAGIC_RADI = 0x52414449
 MAGIC_POLR = 0x504F4C52
-FLOAT_SIDECARS = {
+MAGIC_MOBI = 0x4D4F4249
+REQUIRED_FLOAT_SIDECARS = {
     MAGIC_VA_A, MAGIC_GAMA, MAGIC_RADI, MAGIC_POLR,
 }
+FLOAT_SIDECARS = REQUIRED_FLOAT_SIDECARS | {MAGIC_MOBI}
 
 TRAJECTORY_FIELDS = (
     "time", "cell_id", "x", "y", "vx", "vy", "px", "py", "theta",
@@ -449,6 +451,8 @@ def read_float_sidecars(
             raise ExportError(
                 f"per-cell sidecar 0x{sidecar_magic:08x} contains non-finite data"
             )
+        if sidecar_magic == MAGIC_MOBI and any(value <= 0 for value in values):
+            raise ExportError("phase-field mobility must be positive")
         sidecars[sidecar_magic] = FloatSidecar(
             values=values,
             payload_sha256=hashlib.sha256(payload).hexdigest(),
@@ -459,7 +463,7 @@ def read_float_sidecars(
 def add_sidecar_metadata(
     parameters: dict[str, object], sidecars: dict[int, FloatSidecar],
 ) -> bool:
-    missing = FLOAT_SIDECARS - sidecars.keys()
+    missing = REQUIRED_FLOAT_SIDECARS - sidecars.keys()
     if missing:
         formatted = ", ".join(f"0x{magic:08x}" for magic in sorted(missing))
         raise ExportError(
@@ -483,6 +487,15 @@ def add_sidecar_metadata(
             "maximum": max(sidecar.values),
             "payload_sha256": sidecar.payload_sha256,
         }
+    mobility = sidecars.get(MAGIC_MOBI)
+    summaries["mobility"] = {
+        "count": len(per_cell_v_a),
+        "minimum": min(mobility.values) if mobility else 0.5,
+        "maximum": max(mobility.values) if mobility else 0.5,
+        "source": "MOBI" if mobility else "default without MOBI",
+        "payload_sha256": mobility.payload_sha256 if mobility else None,
+        "transferred_to_3d": False,
+    }
     expected_radius = as_float32(float(parameters["radius"]))
     if any(value != expected_radius for value in sidecars[MAGIC_RADI].values):
         raise ExportError(

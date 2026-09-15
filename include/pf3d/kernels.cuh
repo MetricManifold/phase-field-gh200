@@ -1,6 +1,6 @@
 #pragma once
 
-// CUDA state and launch interfaces for the three-dimensional solver. Its
+// CUDA state and launch interfaces for the three-dimensional solver.
 // Cell support is a logical cube; bounded geometries may store fewer z planes.
 // Fields are x-fastest. Updates stage halo tiles, not whole cells, in shared memory.
 
@@ -26,16 +26,29 @@ constexpr int kHaloZ = kBrickZ + 2;
 constexpr int kBrickVoxels = kBrickX * kBrickY * kBrickZ;
 constexpr int kHaloVoxels = kHaloX * kHaloY * kHaloZ;
 
+// A three-float prefix aligns each row's 32 interior values for float4 copies.
+// The buffer stride includes the final ghost and preserves 16-byte alignment.
+constexpr int kHaloRowStride = 36;
+constexpr int kHaloLeadingPadding = 3;
+constexpr int kHaloBufferWords =
+    ((kHaloLeadingPadding + kHaloRowStride * kHaloY * kHaloZ + 3) / 4) * 4;
+
 // Brick kernels double-buffer halo tiles so global reads overlap stencil work.
 // Launches and occupancy queries must use this extent after raising the
 // per-kernel dynamic-shared-memory limit. Configure once on each device when
 // allocating a simulation; launch-only callers configure lazily on first use.
 constexpr std::size_t kHaloPipelineBytes =
-    2u * static_cast<std::size_t>(kHaloVoxels) * sizeof(float);
+    2u * static_cast<std::size_t>(kHaloBufferWords) * sizeof(float);
 cudaError_t configure_tile_kernel_shared_memory();
 
 static_assert(kThreads3D == 256, "the deterministic reductions assume 8 warps");
 static_assert(kBrickX % 4 == 0, "brick rows must support 16-byte transfers");
+static_assert(kHaloRowStride % 4 == 0 && kHaloBufferWords % 4 == 0,
+              "halo rows and buffers must preserve 16-byte alignment");
+static_assert(kHaloLeadingPadding + (kHaloY * kHaloZ - 1) * kHaloRowStride +
+              kHaloX <= kHaloBufferWords, "the final halo row must fit");
+static_assert(kBrickAlignment % 4 == 0,
+              "partial brick rows must contain complete float4 groups");
 
 // Sticky integrity counters.  CellState3D::flags uses the same values as bit
 // positions; global_flags, when non-null, contains one count per value.

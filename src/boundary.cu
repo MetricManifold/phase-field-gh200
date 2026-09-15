@@ -72,7 +72,7 @@ __global__ void count_squares(const float* phi, const CellState* cells,
         const double y = (double)c.gy0 + c.Cy/c.V;
         m.cx = (float)(x - floor(x/side)*side);
         m.cy = (float)(y - floor(y/side)*side);
-        m.gamma = c.gamma; m.mobility = (float)kPhaseFieldMobility;
+        m.gamma = c.gamma; m.mobility = c.M_pf;
         m.active_speed = c.v_A; m.radius = c.R_tgt;
         m.squares = invalid[0] ? UINT32_MAX : counts[0];
         meta[i] = m;

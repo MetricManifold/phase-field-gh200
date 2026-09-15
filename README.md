@@ -42,18 +42,20 @@ storage, random-counter domains, and update kernels remain dimension-specific.
 For a two-dimensional cell `n`, the phase field is advanced as
 
 ```text
-dphi_n/dt = gamma_n lap(phi_n)
+dphi_n/dt = (M_n/M0) { gamma_n lap(phi_n)
           - (30 gamma_n/lambda^2) phi_n(1-phi_n)(1-2phi_n)
           + (2 mu/A0)(A0-V_n) phi_n
-          - (60 kappa/lambda^2) phi_n sum_(m!=n) phi_m^2
+          - (60 kappa/lambda^2) phi_n sum_(m!=n) phi_m^2 }
           - v_n . grad(phi_n),
 
 v_n = v_A p_n + (60 kappa/(xi lambda^2))
       integral(phi_n grad(phi_n) sum_(m!=n) phi_m^2 dA).
 ```
 
-Here `V_n = integral(phi_n^2 dA)` and `A0 = pi R^2`. The 2D code uses `M=1/2`,
-`dx=dy=1`, a nine-point isotropic Laplacian, centered gradients, periodic
+Here `V_n = integral(phi_n^2 dA)`, `A0 = pi R^2`, and `M0=0.5`.
+Every 2D cell defaults to `M_n=M0`; mobility scales all four passive terms,
+never advection or the velocity equation. The 2D code uses `dx=dy=1`,
+a nine-point isotropic Laplacian, centered gradients, periodic
 boundaries, and binary32 phase fields. Coefficients are defined once in
 [`include/params.cuh`](include/params.cuh). In particular, the interaction and
 motility coefficients satisfy `interaction/motility = xi` by construction.
@@ -104,6 +106,27 @@ of [Chiang *et al.*, *Physical Review E* 110, 044403
 (2024)](https://doi.org/10.1103/PhysRevE.110.044403). Slab height must be shown
 not to affect observables before the geometry is used for scientific results.
 
+## Cell-specific 2D mobility
+
+`--phase-field-mobility` sets a uniform physical Allen-Cahn mobility (default
+`0.5`). A map overrides individual stable cell IDs; for example, `mobility.txt`:
+
+```text
+7 0.75
+```
+
+```bash
+./build/cell_gh200 --N 100 --t-end 10 \
+  --phase-field-mobility 0.5 --phase-field-mobility-map mobility.txt \
+  --out trajectory.txt --checkpoint-dir checkpoints
+```
+
+Changing mobility affects interfacial, area and overlap relaxation together;
+it is not a surface-tension-only adjustment. Current-format checkpoints store
+per-cell values in `MOBI`; map-only restart preserves unlisted stored values.
+The map is 2D-only and is not transferred when exporting centres to 3D.
+See [mobility, restart precedence and compatibility](docs/cell-specific-mobility.md).
+
 ## Optional 2D observations
 
 `--velocity-moments velocity.bin` records the active, interaction, interfacial,
@@ -142,6 +165,10 @@ Windows builds with MSVC 19.44 and CUDA 12.5.82 also pass the host and
 checkpoint-I/O tests. That compiler emits register spills in some 2D
 specializations, so these build checks do not establish GH200 performance;
 use the measured toolchain when reproducing the reported timings.
+
+The integrated mobility and vector-halo updates also passed 57 CPU/GPU tests
+on H100 with GCC 12.3 and CUDA 13.2, plus the halo-loader racecheck. This was a
+single-GPU check; it does not extend the two-device validation claims below.
 
 ## Build
 
@@ -271,7 +298,8 @@ This command compares the current one- and two-device executables. For a
 cross-version regression, replace the two reference paths with separately
 built, pinned reference executables.
 
-Short write-free benchmarks on GH200 GPUs gave the following medians of two
+Before the vector halo loader was integrated, short write-free benchmarks on
+GH200 GPUs gave the following medians of two
 windows, bracketed by runs of the preceding implementation. Hours/tau use
 `dt=0.01` and `tau=10000`; they exclude initialization, growth and output costs.
 
@@ -290,8 +318,8 @@ Their windows contain 100 accepted steps. The fresh N=200 channel has domain
 Its windows cover only the first 20 steps before support growth: they are
 not measurements of a mature N=200 state or a long-run forecast.
 
-Tile staging advances integer coordinates with row/plane carries, and
-measurements reuse fixed boundary maps. These changes reduced runtime by
+That implementation used scalar tile staging with row/plane carries and
+fixed boundary maps for measurements. Those changes reduced runtime by
 1.8–4.5% in the bracketed comparisons, without changing halo contents or
 measurement grouping. The build used CUDA 13.1.115 and `sm_90`, without
 fast-math or register spills; all timing guards passed without promotion or
@@ -300,6 +328,23 @@ full checkpoints, trajectories and projected boundaries against the preceding
 implementation on one and two devices. The N=40 two-device 5+5 restart also
 matched. Height-matched storage saves 250 MiB of phase allocation per device
 in the N=64 fixture; checkpoint sizes are unchanged.
+
+The current default instead uses aligned vector halo copies and a nonzero
+scan that follows the copying thread's ownership. With CUDA 13.1.115 and
+`sm_90`, two repeated two-GPU windows gave the following rates on the same
+N=64 saved state and fresh N=200 configuration:
+
+| Fixture | Two GPUs, ms/step | Hours/tau |
+| --- | ---: | ---: |
+| N=64 channel, evolved | 3.527 | 0.980 |
+| N=200 channel, fresh | 9.485 | 2.635 |
+
+These cover only 100 and 20 write-free steps respectively, not mature N=200
+or long-run production performance. The corrected loader passed the focused
+36-case race check and ten-step exact checkpoint, trajectory, and boundary
+comparisons on the N=40 substrate and N=64 channel states; the substrate's
+two-GPU split restart also matched. See the [loader design and targeted
+test](docs/three-dimensional-solver.md#public-tests-and-scientific-validation).
 
 This implementation replicates storage: it does not double cell capacity.
 Fast updates first process whole tiles intersecting the outgoing aggregate
@@ -621,7 +666,7 @@ rolling `checkpoint.bin` remains available.
 
 Starting twice from the same checkpoint with the same parameters produces the
 same run-and-tumble events. Checkpoints preserve polarity angle, velocity,
-cell identity, simulation step, phase field, both full 64-bit random streams,
+cell identity, per-cell mobility, simulation step, phase field, both full 64-bit random streams,
 the initial-centre fingerprint, cached interface measure, exact moments and
 support bounds, shape class, and the shape-class demotion counter. Thus the
 next update consumes the same adaptive and floating-point state as an
@@ -783,6 +828,14 @@ Python checkpoint-header test:
 ```bash
 ctest --test-dir build -C Release --output-on-failure
 ```
+
+The focused `pf2d_mobility_model` and `pf2d_mobility_checkpoint` cases cover
+default arithmetic, passive-only scaling, stability guards, maps, restart
+precedence and optional `MOBI` validation. The model case requires a known
+no-contraction host compiler flag. The checkpoint case runs host checks and
+also exercises the real writer when a CUDA device is available. GPU-enabled
+builds add `pf2d_velocity_observer_mobility` for heterogeneous-mobility
+observation and update checks; these registrations are not validation results.
 
 `PF_ENABLE_CHECKPOINT_IO_TESTS=ON` adds 2D/3D writer and reader contract tests,
 including the 3D prober and CRC checks. They require any CUDA device for

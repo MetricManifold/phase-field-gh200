@@ -47,12 +47,14 @@ struct alignas(64) CellState {
     // are cumulative within a run and are not checkpointed.
     uint32_t reserved[2];
     velocity::AdvectionAccum advection; // runtime-only observer state
-    uint32_t reserved_unused[2];
+    uint32_t reserved_unused;
+    float    M_pf = static_cast<float>(kPhaseFieldM0); // passive RHS mobility
 };
 static_assert(sizeof(CellState) == 192, "CellState must be exactly 192 B");
 static_assert(alignof(CellState) == 64, "CellState must be 64 B aligned");
 static_assert(offsetof(CellState, advection) == 128, "observer storage moved");
 static_assert(offsetof(CellState, reserved) == 120, "diagnostic storage moved");
+static_assert(offsetof(CellState, M_pf) == 188, "mobility storage moved");
 
 // Compact trajectory record written to mapped host-pinned memory on GH200.
 struct TrajPackedCell {
@@ -113,6 +115,28 @@ struct StepArgs {
     unsigned long long clear_ahead_words;   // number of S words to clear; 0 skips
 };
 
+// mrel = M_i/M0 scales all passive terms, never advection. The default branch
+// preserves the original arithmetic order without multiplying by one. Both
+// update kernels and host tests share this RHS; mrel is uniform per cell.
+__host__ __device__ __forceinline__ float phase_field_rhs(
+    float lap, float phi, float S_other, float gx, float gy,
+    float gam, float dwC, float volC, float repC,
+    float vx, float vy, float mrel)
+{
+    if (mrel == 1.0f) {
+        return gam * lap
+             - dwC * (phi * (1.0f - phi) * (1.0f - 2.0f * phi))
+             + volC * phi
+             - repC * phi * S_other
+             - (vx * gx + vy * gy);
+    }
+    return mrel * (gam * lap
+                 - dwC * (phi * (1.0f - phi) * (1.0f - 2.0f * phi))
+                 + volC * phi
+                 - repC * phi * S_other)
+         - (vx * gx + vy * gy);
+}
+
 // The counter primitive is shared with 3D. This solver defines its own counter
 // domains below, so existing 2D trajectories retain their random streams.
 using Philox4 = pf_common::Philox4;
@@ -149,6 +173,7 @@ inline double ic_v_A(int32_t gid, unsigned long long seed,
 
 // Kernel definitions are in kernels.cu. Dynamic shared memory limits k_step to
 // one resident 768-thread block per SM.
+#if defined(__CUDACC__)
 __global__ __launch_bounds__(kBlockThreads, 1)
 void k_step(PF_GRID_CONSTANT const StepArgs A);
 
@@ -185,6 +210,7 @@ __global__ void k_pack_traj(const CellState* cell, const uint8_t* cls,
 // at least N and requires M*8 bytes of dynamic shared memory.
 __global__ void k_morton_sort(const CellState* cell, uint32_t* perm,
                               int N, int M, int L);
+#endif  // __CUDACC__; ordinary C++ consumers use the state and host helpers.
 
 // Observation mode selects a compile-time kernel specialization.
 enum class VelocityStep { Disabled, Advection, Spatial };

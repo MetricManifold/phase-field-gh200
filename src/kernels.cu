@@ -116,6 +116,8 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
         const float gam  = cs.gamma;
         const float dwC  = A.bulk_scale * gam;
         const float volC = (float)(A.vol_scale * (A.A0 - cs.V));
+        // Relative Allen-Cahn mobility M_i/M0; exactly 1.0f at the default.
+        const float mrel = cs.M_pf * (float)(1.0 / kPhaseFieldM0);
 
         // Select the smallest class containing the support plus promotion
         // margin. Demotion requires kDemoteDwell consecutive checks with the
@@ -184,6 +186,7 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
         bci[19] = tumbled;
         bci[20] = dwx;            bci[21] = dwy;
         bci[22] = dtx0;           bci[23] = dty0;
+        bcf[25] = mrel;
         if constexpr (Spatial) velocity::broadcast_geometry(bcf, cs);
     }
 
@@ -357,6 +360,7 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
         const float vxf  = bcf[14];
         const float vyf  = bcf[15];
         const float repC = A.rep_coeff;
+        const float mrel = bcf[25];
         const float dtf  = A.dt;
         const int   y0   = warp * RB;
 
@@ -399,11 +403,9 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
                         qS = A.S_rd[(size_t)ggy * A.P + ggx];
                     }
                     const float So = s_other(qS, cC, A.flags);
-                    const float rhs = gam * lap
-                                    - dwC * (cC * (1.0f - cC) * (1.0f - 2.0f * cC))
-                                    + volC * cC
-                                    - repC * cC * So
-                                    - (vxf * gx + vyf * gy);
+                    const float rhs = phase_field_rhs(lap, cC, So, gx, gy,
+                                                      gam, dwC, volC, repC,
+                                                      vxf, vyf, mrel);
                     const float pnew = cC + dtf * rhs;
                     if constexpr (kStagesS<CLS>) {
                         S_s[y * WX + x] = __float_as_uint(pnew);
@@ -638,6 +640,8 @@ __device__ __noinline__ void process_cell_fallback(
         const float gam  = cs.gamma;
         const float dwC  = A.bulk_scale * gam;
         const float volC = (float)(A.vol_scale * (A.A0 - cs.V));
+        // Relative Allen-Cahn mobility M_i/M0; exactly 1.0f at the default.
+        const float mrel = cs.M_pf * (float)(1.0 / kPhaseFieldM0);
 
         const int ex = cs.bb_hi_x - cs.bb_lo_x + 1;
         const int ey = cs.bb_hi_y - cs.bb_lo_y + 1;
@@ -702,6 +706,7 @@ __device__ __noinline__ void process_cell_fallback(
         bci[17] = fm; bci[18] = (int)pctr; bci[19] = tumbled;
         bci[20] = dwx; bci[21] = dwy; bci[22] = dc.tx0; bci[23] = dc.ty0;
         bci[24] = no_margin;
+        bcf[25] = mrel;
         if constexpr (Spatial) velocity::broadcast_geometry(bcf, cs);
     }
     __syncthreads();
@@ -783,6 +788,7 @@ __device__ __noinline__ void process_cell_fallback(
 
     const float gam = bcf[8], dwC = bcf[9], volC = bcf[10];
     const float vxf = bcf[14], vyf = bcf[15];
+    const float mrel = bcf[25];
     const int sx = bci[0], sy = bci[1];
     const int dwx = bci[20], dwy = bci[21];
     const int dtx0 = bci[22], dty0 = bci[23];
@@ -811,11 +817,9 @@ __device__ __noinline__ void process_cell_fallback(
                 if (gy >= A.L) gy -= A.L;
                 const float So = s_other(
                     A.S_rd[(size_t)gy * A.P + gx_global], cC, A.flags);
-                const float rhs = gam * lap
-                                - dwC * (cC * (1.0f - cC) * (1.0f - 2.0f * cC))
-                                + volC * cC
-                                - A.rep_coeff * cC * So
-                                - (vxf * gx + vyf * gy_phi);
+                const float rhs = phase_field_rhs(lap, cC, So, gx, gy_phi,
+                                                  gam, dwC, volC, A.rep_coeff,
+                                                  vxf, vyf, mrel);
                 const float pnew = cC + A.dt * rhs;
                 const int a = x - sx, b = y - sy;
                 if ((unsigned)a < (unsigned)dwx &&

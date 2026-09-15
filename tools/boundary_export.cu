@@ -58,6 +58,7 @@ int main(int argc, char** argv) {
             const auto& c = ck.cells[i]; auto& s = state[i];
             s.global_id = c.global_id; s.gx0 = c.origin[0]; s.gy0 = c.origin[1];
             s.cls = c.cls; s.gamma = c.gamma; s.v_A = c.v_A; s.R_tgt = c.R_tgt;
+            s.M_pf = c.M_pf;
             s.V = c.volume_moment; s.Cx = c.moment_x; s.Cy = c.moment_y;
         }
         if (cudaMemcpy(phi, ck.phi.data(), ck.phi.size()*sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||

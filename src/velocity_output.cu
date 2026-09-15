@@ -118,7 +118,7 @@ bool VelocityOutput::pack_frame(long long step, int side) {
         row[2] = std::fmod(double(cell.gy0) + cell.Cy / cell.V, double(side));
         row[3] = cell.theta;
         row[4] = cell.gamma;
-        row[5] = kPhaseFieldMobility;
+        row[5] = cell.M_pf;
         row[6] = cell.v_A;
         row[7] = cell.V;
         row[8] = double(moments.count);

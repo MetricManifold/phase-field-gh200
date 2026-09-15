@@ -259,6 +259,30 @@ include(CTest)
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+  if(PF_HOST_NO_CONTRACTION_KNOWN)
+    add_executable(pf2d_mobility_model_test tests/mobility_model_cpu_test.cpp)
+    target_include_directories(pf2d_mobility_model_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/common
+      ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_compile_options(pf2d_mobility_model_test PRIVATE ${PF_HOST_NO_CONTRACTION})
+    pf_enable_warnings(pf2d_mobility_model_test)
+    add_test(NAME pf2d_mobility_model COMMAND pf2d_mobility_model_test)
+  endif()
+
+  add_executable(pf2d_mobility_checkpoint_test tests/mobility_checkpoint_cpu_test.cu)
+  target_include_directories(pf2d_mobility_checkpoint_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/common)
+  target_compile_options(pf2d_mobility_checkpoint_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+  set_target_properties(pf2d_mobility_checkpoint_test PROPERTIES
+    CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+  if(MSVC)
+    target_compile_definitions(pf2d_mobility_checkpoint_test PRIVATE
+      _CRT_SECURE_NO_WARNINGS)
+  endif()
+  pf_enable_warnings(pf2d_mobility_checkpoint_test)
+  add_test(NAME pf2d_mobility_checkpoint COMMAND pf2d_mobility_checkpoint_test)
+
   add_executable(pf2d_velocity_math_test tests/velocity_math_test.cpp)
   target_include_directories(pf2d_velocity_math_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/common ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -280,11 +304,18 @@ if(BUILD_TESTING)
     pf_enable_warnings(pf2d_velocity_observer_test)
     add_test(NAME pf2d_velocity_observer
       COMMAND pf2d_velocity_observer_test --synthetic)
-    set_tests_properties(pf2d_velocity_observer PROPERTIES TIMEOUT 180)
+    add_test(NAME pf2d_velocity_observer_mobility
+      COMMAND pf2d_velocity_observer_test --synthetic-mobility)
+    set_tests_properties(pf2d_velocity_observer pf2d_velocity_observer_mobility
+      PROPERTIES TIMEOUT 180)
     add_test(NAME pf2d_observation_output
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/observation_output_test.py
         --executable $<TARGET_FILE:cell_gh200>)
-    set_tests_properties(pf2d_observation_output PROPERTIES TIMEOUT 300)
+    add_test(NAME pf2d_mobility_outputs
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/observation_output_test.py
+        --executable $<TARGET_FILE:cell_gh200> --mobility)
+    set_tests_properties(pf2d_observation_output pf2d_mobility_outputs
+      PROPERTIES TIMEOUT 300)
   endif()
 
   add_executable(pf2d_boundary_output_test tests/boundary_output_test.cu)
@@ -447,6 +478,17 @@ if(BUILD_TESTING)
     add_test(NAME pf3d_brick_classes_cpu COMMAND pf3d_brick_classes_cpu_test)
 
     if(PF_ENABLE_GPU_TESTS)
+      add_executable(pf3d_halo_pipeline_test tests/3d/halo_pipeline_gpu_test.cu)
+      target_link_libraries(pf3d_halo_pipeline_test PRIVATE pf_shape_config)
+      target_include_directories(pf3d_halo_pipeline_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/common)
+      target_compile_options(pf3d_halo_pipeline_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${PF_CUDA_FLAGS}>)
+      set_target_properties(pf3d_halo_pipeline_test PROPERTIES
+        CUDA_RUNTIME_LIBRARY ${PF_CUDA_RUNTIME})
+      pf_enable_warnings(pf3d_halo_pipeline_test)
+      add_test(NAME pf3d_halo_pipeline_gpu COMMAND pf3d_halo_pipeline_test)
+      set_tests_properties(pf3d_halo_pipeline_gpu PROPERTIES SKIP_RETURN_CODE 77)
       add_executable(pf3d_boundary_output_test tests/3d/boundary_output_gpu_test.cu)
       target_link_libraries(pf3d_boundary_output_test PRIVATE pf3d_boundary)
       target_compile_options(pf3d_boundary_output_test PRIVATE

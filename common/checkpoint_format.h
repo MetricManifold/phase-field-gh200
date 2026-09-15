@@ -16,6 +16,7 @@ constexpr uint32_t MAGIC_VA_A = 0x56415F41;  // 'VA_A' — per-cell v_A
 constexpr uint32_t MAGIC_GAMA = 0x47414D41;  // 'GAMA' — per-cell gamma
 constexpr uint32_t MAGIC_RADI = 0x52414449;  // 'RADI' — per-cell target radius
 constexpr uint32_t MAGIC_POLR = 0x504F4C52;  // 'POLR' — per-cell polarity theta
+constexpr uint32_t MAGIC_MOBI = 0x4D4F4249;  // 'MOBI' — optional per-cell mobility
 
 // Packed on-disk records. Their sizes and field offsets are part of the schema.
 // The checkpoint stores:

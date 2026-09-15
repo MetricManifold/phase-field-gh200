@@ -247,6 +247,15 @@ accumulation order are identical to a synchronous walk: the overlap changes
 throughput but no stored result. That y-strip slab-walk kernel is periodic-only;
 both bounded-z geometries use the boundary-aware tiled update.
 
+The tiled loader uses aligned 16-byte copies for each row's interior and
+scalar copies for the two ghost columns. Shared-memory row padding preserves
+alignment but is never interpreted as field data. After waiting for the
+current asynchronous-copy group, each thread scans only the values it copied;
+a block-wide collective publishes all copies before any cross-thread stencil
+read. The scan treats signed zero as zero, while subnormal and nonfinite
+values remain visible. This path is enabled in every build, including the
+diagnostic build; there is no separate loader option.
+
 Normal updates do not recompute derived summaries for the field they have just
 written, because the next step's mandatory measurement would immediately
 replace them. Scheduled strict verification retains the measured updater.
@@ -486,6 +495,18 @@ cmake --build build --config Release --parallel 8
 ctest --test-dir build -C Release --output-on-failure \
   -R '^(gh200_smoke|gh200_3d_smoke)$'
 ```
+
+The same build also registers `pf3d_halo_pipeline_gpu`, a 36-case test of the
+production asynchronous loader and nonzero scan. It delays selected producer
+warps, checks both buffers and ghost values exactly, and poisons padding to
+detect accidental reads or writes. Run its targeted race check on a GH200 with:
+
+```bash
+ctest --test-dir build -C Release --output-on-failure -R '^pf3d_halo_pipeline_gpu$'
+compute-sanitizer --tool racecheck --error-exitcode 99 build/pf3d_halo_pipeline_test
+```
+
+This is focused loader coverage, not a whole-solver concurrency proof.
 
 For slab science, validation must additionally show neutral-wall contact, zero
 normal polarity and translation, no substrate penetration or top contact, and

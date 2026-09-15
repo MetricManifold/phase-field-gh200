@@ -177,19 +177,57 @@ def validate(exe: Path, baseline: Path | None, root: Path) -> dict:
             "unaligned_restart_and_partial_tail": True, "exclusive_output": True}
 
 
+def validate_mobility(exe: Path, root: Path) -> dict:
+    mobility_map = root / "mobility.txt"
+    mobility_map.write_text("0 1.0\n1 0.625\n")
+    options = ["--N", 6, "--radius", 49, "--rho", .35, "--tau", .1,
+               "--gamma", 1, "--gamma-cancer", .35, "--cancer-fraction", 1/3,
+               "--seed", 20260915, "--polarity-seed", 1592026,
+               "--phase-field-mobility-map", mobility_map, "--t-end", 1,
+               "--trajectory-interval", 7, "--print-interval", 0]
+    record = ["--boundary-interval", "7", "--velocity-spatial-stride", "1"]
+    run(exe, root/"off", options)
+    run(exe, root/"both", options, velocity=True, boundary=True, extra=record)
+    assert_same_physics([root/"off", root/"both"])
+    _, velocity = read_velocity(root/"both/velocity.bin")
+    boundaries = read_boundary(root/"both/boundaries.pfb")
+    joined = check_join(velocity, boundaries)
+    expected = {0: 1., 1: .625, 2: .5, 3: .5, 4: .5, 5: .5}
+    for frame in velocity:
+        assert {int(row[0]): row[5] for row in frame.rows} == expected
+
+    # No mobility options on restart: stored values must remain authoritative.
+    run(exe, root/"half", [*options, "--t-end", .43])
+    run(exe, root/"resumed", ["-c", root/"half/checkpoint.bin", "--t-end", 1,
+                             "--trajectory-interval", 7, "--print-interval", 0],
+        velocity=True, boundary=True, extra=record)
+    assert sha(root/"off/checkpoint.bin") == sha(root/"resumed/checkpoint.bin")
+    _, resumed = read_velocity(root/"resumed/velocity.bin")
+    for frame in resumed:
+        assert {int(row[0]): row[5] for row in frame.rows} == expected
+    joined += check_join(resumed, read_boundary(root/"resumed/boundaries.pfb"))
+    return {"status": "PASS", "heterogeneous_mobility": True,
+            "unchanged_physics_with_outputs": True, "split_restart_exact": True,
+            "joined_cell_frames": joined}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--executable", type=Path, required=True)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--mobility", action="store_true",
+                        help="small heterogeneous-mobility output/restart regression")
     args = parser.parse_args()
     if args.output:
         args.output.mkdir()
-        result = validate(args.executable.resolve(), args.baseline, args.output)
+        result = (validate_mobility(args.executable.resolve(), args.output) if args.mobility else
+                  validate(args.executable.resolve(), args.baseline, args.output))
         (args.output/"RESULT.json").write_text(json.dumps(result, indent=2)+"\n")
     else:
         with tempfile.TemporaryDirectory(prefix="pf-observations-") as directory:
-            result = validate(args.executable.resolve(), args.baseline, Path(directory))
+            result = (validate_mobility(args.executable.resolve(), Path(directory)) if args.mobility else
+                      validate(args.executable.resolve(), args.baseline, Path(directory)))
     print(json.dumps(result))
     return 0
 

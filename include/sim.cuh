@@ -44,6 +44,8 @@ struct RunOptions {
     bool boundary_compress = false;
     // Fresh starts only; empty selects the built-in grid-and-jitter placement.
     std::string initial_centres_path;
+    PhaseFieldMobilityMap phase_field_mobility_map;
+    bool phase_field_mobility_map_given = false;
 
     // Empty ckpt_dir disables all checkpoints. Cadences use elapsed-step
     // thresholds because a graph replay advances multiple physical steps.
@@ -93,7 +95,7 @@ private:
     bool     build_graph();
     bool     seed_positions(std::vector<float>& cx, std::vector<float>& cy,
                             std::vector<float>& gam, std::vector<float>& va,
-                            std::vector<int32_t>& gid);
+                            std::vector<float>& mob, std::vector<int32_t>& gid);
     void     print_line();
     // Stop on a fatal flag or failed flag readback.
     bool     fatal_flag_set();

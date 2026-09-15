@@ -43,9 +43,9 @@ cell. Each 20-byte square record contains its local grid coordinates and four
 original field values. Square ordering within a cell is not significant.
 Metadata contain stable IDs, tile origins, centroids, gamma, phase-field
 mobility, active speed, radius and square count.
-The public two-dimensional solver has fixed phase-field mobility `M=0.5`;
-this is the value recorded for every cell. Exporting boundaries does not add
-cell-specific mobility or change the model.
+Mobility is the cell's actual `M_i`, with default `0.5`, including after
+checkpoint restart or per-cell overrides. Exporting boundaries does not
+change mobility or any other model parameter.
 
 A `PFBEND1` record records the last time and total frame count. It marks a
 cleanly closed output stream, not completion of a scientific run: a clean

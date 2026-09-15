@@ -3,8 +3,10 @@
 The optional recorder measures the contributions to the phase-field centroid
 velocity. It uses the actual field, interaction sum and imposed direction
 consumed by the update. It does not change the PDE, timestep, random stream,
-initialization or checkpoint format. Public 2D main uses fixed mobility
-M=0.5; the file records that value explicitly.
+initialization or checkpoint format. The file records each cell's actual
+phase-field mobility, whose default is M=0.5. Cell-specific mobility scales
+the passive interfacial, overlap and area contributions by M_i/0.5; propulsion,
+interaction advection and the advection correction are not scaled.
 
 For example, in a new output directory:
 

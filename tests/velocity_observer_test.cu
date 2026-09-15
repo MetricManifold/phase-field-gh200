@@ -19,7 +19,7 @@ using velocity::MomentAccum;
         }                                                                                      \
     } while (0)
 
-static CheckpointData synthetic() {
+static CheckpointData synthetic(bool variable_mobility) {
     CheckpointData d;
     d.n = kNumClasses;
     d.params.num_cells = d.n;
@@ -36,6 +36,7 @@ static CheckpointData synthetic() {
         c.origin[0] = (680 + i * 100 - sc.wx / 2 + 701) % 701;
         c.origin[1] = (11 + i * 130 - sc.wy / 2 + 701) % 701;
         c.gamma = i % 2 ? .35f : 1.f;
+        c.M_pf = variable_mobility ? .25f + .125f * (i % 5) : .5f;
         c.v_A = .01f;
         c.R_tgt = 49.f;
         c.theta = .4f + float(i);
@@ -120,7 +121,8 @@ static ReferenceMetrics check_reference(const CheckpointData& d,
                     for (int xx = -1; xx <= 1; ++xx)
                         if (xx || yy)
                             lap += f(x + xx, y + yy) * ((xx && yy) ? 1. / 6. : 2. / 3.);
-                double mobility = 1.0, dw = (float)(A.bulk_scale * c.gamma);
+                double mobility = (double)(c.M_pf / (float)kPhaseFieldM0);
+                double dw = (float)(A.bulk_scale * c.gamma);
                 double sources[4] = {
                     mobility * (c.gamma * lap - dw * v * (1 - v) * (1 - 2 * v)),
                     -mobility * A.rep_coeff * v * (double)other(x, y),
@@ -171,6 +173,57 @@ static ReferenceMetrics check_reference(const CheckpointData& d,
         }
     }
     return {max_force, max_moment, max_quotient, max_area, max_euler, max_half};
+}
+
+static double check_euler_update(const CheckpointData& d, const std::vector<CellState>& before,
+                                const std::vector<CellState>& after,
+                                const std::vector<uint32_t>& aggregate,
+                                const std::vector<float>& updated, const StepArgs& args) {
+    // Independent double-precision stencil/RHS on the same pre-step float field.
+    // Compare source-window interior points after resolving the integer shift;
+    // output outside that window is covered by the separate storage tests.
+    double worst = 0.;
+    for (int i = 0; i < d.n; ++i) {
+        const auto& cell = before[i];
+        const auto old_shape = class_of(cell.cls), new_shape = class_of(after[i].cls);
+        const auto wrap = [&](int x) { return (x % args.L + args.L) % args.L; };
+        int sx = after[i].gx0 - cell.gx0, sy = after[i].gy0 - cell.gy0;
+        if (sx > args.L / 2) sx -= args.L;
+        if (sx < -args.L / 2) sx += args.L;
+        if (sy > args.L / 2) sy -= args.L;
+        if (sy < -args.L / 2) sy += args.L;
+        const auto field = [&](int x, int y) -> double {
+            return d.phi[(size_t)i * kTileArea +
+                         (old_shape.ty0 + y) * kTilePitch + old_shape.tx0 + x];
+        };
+        const double m = (double)cell.M_pf / kPhaseFieldM0;
+        const double bulk = (float)(args.bulk_scale * cell.gamma);
+        const double area = (float)(args.vol_scale * (args.A0 - cell.V));
+        for (int y = 0; y < new_shape.wy; ++y) {
+            for (int x = 0; x < new_shape.wx; ++x) {
+                const int ox = x + sx, oy = y + sy;
+                if (ox < 1 || oy < 1 || ox >= old_shape.wx - 1 || oy >= old_shape.wy - 1)
+                    continue;
+                const double p = field(ox, oy);
+                const double e = field(ox + 1, oy), w = field(ox - 1, oy);
+                const double n = field(ox, oy + 1), s = field(ox, oy - 1);
+                const double lap = (4. * (e + w + n + s) - 20. * p +
+                    field(ox - 1, oy - 1) + field(ox + 1, oy - 1) +
+                    field(ox - 1, oy + 1) + field(ox + 1, oy + 1)) / 6.;
+                const uint32_t total = aggregate[(size_t)wrap(cell.gy0 + oy) * args.P +
+                                                  wrap(cell.gx0 + ox)];
+                const float others = (float)(total - q_of((float)p)) * kQInvF;
+                const double passive = cell.gamma * lap - bulk * p * (1. - p) * (1. - 2. * p)
+                    + area * p - args.rep_coeff * p * others;
+                const double advect = after[i].vx * .5 * (e - w) + after[i].vy * .5 * (n - s);
+                const double expected = p + args.dt * (m * passive - advect);
+                const float actual = updated[(size_t)i * kTileArea +
+                    (new_shape.ty0 + y) * kTilePitch + new_shape.tx0 + x];
+                worst = std::fmax(worst, std::fabs(actual - expected));
+            }
+        }
+    }
+    return worst;
 }
 
 static bool check_fused_paths(const CheckpointData& d, const std::vector<CellState>& cs,
@@ -236,6 +289,9 @@ static bool check_fused_paths(const CheckpointData& d, const std::vector<CellSta
         std::vector<CellState> offcell(N), oncell(N);
         GPU(cudaMemcpy(offphi.data(), next, d.phi.size() * 4, cudaMemcpyDeviceToHost));
         GPU(cudaMemcpy(offcell.data(), dc, N * sizeof(CellState), cudaMemcpyDeviceToHost));
+        const double euler_error = check_euler_update(d, cs, offcell, S, offphi, A);
+        std::printf("independent_interior_euler_max_abs_error=%.17g\n", euler_error);
+        ok = ok && euler_error < 2e-6;
         reset();
         A.moments = dq;
         launch_step(A, k_step_grid(0), 0, nullptr, 0, 0, VelocityStep::Spatial);
@@ -310,13 +366,14 @@ static bool check_fused_paths(const CheckpointData& d, const std::vector<CellSta
 
 int main(int argc, char** argv) {
     if (argc != 2) {
-        std::fprintf(stderr, "usage: probe CHECKPOINT|--synthetic\n");
+        std::fprintf(stderr, "usage: probe CHECKPOINT|--synthetic|--synthetic-mobility\n");
         return 2;
     }
     CheckpointData d;
-    bool synth = std::string(argv[1]) == "--synthetic";
+    bool variable_mobility = std::string(argv[1]) == "--synthetic-mobility";
+    bool synth = variable_mobility || std::string(argv[1]) == "--synthetic";
     if (synth)
-        d = synthetic();
+        d = synthetic(variable_mobility);
     else if (!checkpoint_read(argv[1], &d))
         return 2;
     auto p = d.params;
@@ -333,6 +390,7 @@ int main(int argc, char** argv) {
         z.global_id = c.global_id;
         z.cls_written[0] = z.cls_written[1] = c.cls;
         z.gamma = c.gamma;
+        z.M_pf = c.M_pf;
         z.v_A = c.v_A;
         z.theta = c.theta;
         for (int y = 0; y < sc.wy; ++y)

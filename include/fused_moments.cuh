@@ -69,10 +69,15 @@ template <> struct RelaxMoments<true> {
         __syncthreads();
         if (threadIdx.x == 0) {
             auto& m = state.moments[cell];
+            const double mrel = static_cast<double>(state.cell[cell].M_pf) /
+                                kPhaseFieldM0;
             for (int j = 0; j < kSpatialValues; ++j) {
                 double rate = 0.0;
                 for (int w = 0; w < kWarpsPerBlock; ++w)
                     rate += reduction[w * kRedSlots + j];
+                // Only the passive interfacial and overlap rates live here.
+                // The uniform area source has exactly zero centroid moment.
+                if (mrel != 1.0) rate *= mrel;
                 if (m.spatial_count > 1)
                     m.correction[j] +=
                         linear_correction(state.physical_dt, m.last_interval, m.held[j], rate);

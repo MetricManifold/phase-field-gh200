@@ -8,10 +8,14 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace pf {
 namespace {
@@ -136,14 +140,15 @@ bool tile_bboxes(const float* tile, int T, int sup_lo[kCkptDims],
     return sup_hi[0] >= 0;
 }
 
-// Read the four required per-cell arrays. Current checkpoints contain each
-// array exactly once; unknown or duplicate payloads are rejected.
+// Read four required arrays and the optional mobility array. Each occurs at
+// most once; absent MOBI retains the M=0.5 default.
 bool read_sidecars(std::FILE* f, int n, CheckpointData* out) {
     std::vector<float> buf;
     bool had_vA = false;
     bool had_gamma = false;
     bool had_radius = false;
     bool had_polr = false;
+    out->had_mobi = false;
     for (;;) {
         ckpt::SidecarBlockHeader sh{};
         const size_t got = std::fread(&sh, 1, sizeof(sh), f);
@@ -153,7 +158,8 @@ bool read_sidecars(std::FILE* f, int n, CheckpointData* out) {
             return false;
         }
         if (sh.magic != ckpt::MAGIC_VA_A && sh.magic != ckpt::MAGIC_GAMA &&
-            sh.magic != ckpt::MAGIC_RADI && sh.magic != ckpt::MAGIC_POLR) {
+            sh.magic != ckpt::MAGIC_RADI && sh.magic != ckpt::MAGIC_POLR &&
+            sh.magic != ckpt::MAGIC_MOBI) {
             std::fprintf(stderr,
                 "[ckpt] unsupported sidecar 0x%08X in current checkpoint\n",
                 sh.magic);
@@ -183,6 +189,15 @@ bool read_sidecars(std::FILE* f, int n, CheckpointData* out) {
             }
         }
         switch (sh.magic) {
+            case ckpt::MAGIC_MOBI:
+                if (out->had_mobi) {
+                    std::fprintf(stderr, "[ckpt] duplicate MOBI sidecar\n");
+                    return false;
+                }
+                for (int i = 0; i < n; ++i)
+                    out->cells[static_cast<size_t>(i)].M_pf = buf[static_cast<size_t>(i)];
+                out->had_mobi = true;
+                break;
             case ckpt::MAGIC_VA_A:
                 if (had_vA) {
                     std::fprintf(stderr, "[ckpt] duplicate VA_A sidecar\n");
@@ -313,6 +328,7 @@ void SimOverrides::apply(SimParams& p, const SimParams& cli) const {
     if (dt)              p.dt = cli.dt;
     if (v_A)             p.v_A = cli.v_A;
     if (v_A_sigma)       p.v_A_sigma = cli.v_A_sigma;
+    if (phase_field_mobility) p.phase_field_mobility = cli.phase_field_mobility;
     if (tau)             p.tau = cli.tau;
     if (gamma)           p.gamma_normal = cli.gamma_normal;
     if (gamma_cancer)    p.gamma_cancer = cli.gamma_cancer;
@@ -428,7 +444,7 @@ bool checkpoint_read(const std::string& path, CheckpointData* out) {
             "[ckpt] checkpoint time does not match step multiplied by dt\n");
         return false;
     }
-    if (!validate(out->params)) {
+    if (!validate(out->params, true)) {
         std::fprintf(stderr, "[ckpt] checkpoint parameters are invalid\n");
         return false;
     }
@@ -572,15 +588,24 @@ bool checkpoint_read(const std::string& path, CheckpointData* out) {
     }
 
     if (!read_sidecars(f, n, out)) return false;
+    std::vector<float> gamma(static_cast<size_t>(n));
+    std::vector<float> mobility(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        gamma[static_cast<size_t>(i)] = out->cells[static_cast<size_t>(i)].gamma;
+        mobility[static_cast<size_t>(i)] = out->cells[static_cast<size_t>(i)].M_pf;
+    }
+    if (!validate_effective_stiffness(out->params, gamma.data(), mobility.data(), n))
+        return false;
 
     std::printf("[ckpt] loaded %s: schema %u, step %d, t %.4f, %d cells, "
                 "L=%d, tile %d\n"
                 "       classes round/wide/tall/square/large/fallback "
-                "%d/%d/%d/%d/%d/%d; stored fields:%s%s%s%s\n",
+                "%d/%d/%d/%d/%d/%d; stored fields:%s%s%s%s%s\n",
                 path.c_str(), pre.version, pre.step, pre.cur_time, n, L,
                 tile_pitch, cls_hist[0], cls_hist[1], cls_hist[2],
                 cls_hist[3], cls_hist[4], cls_hist[5],
-                " polarity", " gamma", " v_A", " radius");
+                " polarity", " gamma", " v_A", " radius",
+                out->had_mobi ? " mobility" : "");
     std::printf("       maximum support (phi > %.0e): %d x %d px; "
                 "round guarded/fallback physical limits %d/%d px\n",
                 (double)kSupportEps, max_ext[0], max_ext[1],
@@ -635,6 +660,166 @@ void resolve_per_cell_scalars(const SimParams& p, const SimOverrides& ov,
     }
 }
 
+bool read_phase_field_mobility_map(const std::string& path,
+                                   PhaseFieldMobilityMap* out,
+                                   std::string* error) {
+    out->entries.clear();
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        *error = "cannot open " + path + ": " + std::strerror(errno);
+        return false;
+    }
+    struct Closer {
+        std::FILE* f;
+        ~Closer() { if (f) std::fclose(f); }
+    } closer{f};
+
+    auto fail = [&](int lineno, const char* what) {
+        *error = path + ":" + std::to_string(lineno) + ": " + what +
+                 " (expected one 'global_id value' pair per line)";
+        return false;
+    };
+
+    char line[256];
+    int lineno = 0;
+    std::unordered_set<int32_t> seen;
+    while (std::fgets(line, sizeof(line), f)) {
+        ++lineno;
+        const size_t len = std::strlen(line);
+        if (len + 1 == sizeof(line) && line[len - 1] != '\n')
+            return fail(lineno, "line exceeds 254 characters");
+
+        const char* s = line;
+        while (*s && std::isspace(static_cast<unsigned char>(*s))) ++s;
+        if (*s == '\0' || *s == '#') continue;
+
+        char* end = nullptr;
+        errno = 0;
+        const long long id = std::strtoll(s, &end, 10);
+        if (end == s || !std::isspace((unsigned char)*end))
+            return fail(lineno, "malformed global id");
+        if (errno == ERANGE || id < 0 || id > 2147483647LL)
+            return fail(lineno, "global id out of the int32 range or negative");
+
+        s = end;
+        while (*s && std::isspace(static_cast<unsigned char>(*s))) ++s;
+        const double v = std::strtod(s, &end);
+        if (end == s) return fail(lineno, "malformed mobility value");
+        s = end;
+        while (*s && std::isspace(static_cast<unsigned char>(*s))) ++s;
+        if (*s != '\0')
+            return fail(lineno, "trailing characters after the value");
+
+        const float mv = (float)v;
+        if (!std::isfinite(v) || !std::isfinite(mv) || !(mv > 0.0f))
+            return fail(lineno,
+                        "mobility must be finite and positive as binary32");
+        if (!seen.insert((int32_t)id).second)
+            return fail(lineno, "duplicate global id");
+        out->entries.emplace_back((int32_t)id, mv);
+    }
+    if (std::ferror(f)) {
+        *error = "read error on " + path;
+        return false;
+    }
+    if (out->entries.empty()) {
+        *error = path + ": contains no 'global_id value' entries";
+        return false;
+    }
+    return true;
+}
+
+bool overlay_phase_field_mobility(const PhaseFieldMobilityMap& map,
+                                  const int32_t* gid, int n,
+                                  float* inout, std::string* error) {
+    if (map.entries.empty()) return true;
+
+    std::unordered_map<int32_t, int> index;
+    index.reserve((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        if (!index.emplace(gid[i], i).second) {
+            // A duplicated global id would silently receive a map value on
+            // only one of its records; that is corruption, not a labeling.
+            *error = "global cell id " + std::to_string(gid[i]) +
+                     " is duplicated among the simulated cells; refusing to "
+                     "apply mobility overrides";
+            return false;
+        }
+    }
+    for (const auto& e : map.entries) {
+        const auto it = index.find(e.first);
+        if (it == index.end()) {
+            *error = "map id " + std::to_string(e.first) +
+                     " does not exist among the " + std::to_string(n) +
+                     " simulated global cell ids";
+            return false;
+        }
+        inout[it->second] = e.second;
+    }
+    return true;
+}
+
+bool apply_phase_field_mobility(const PhaseFieldMobilityMap& map,
+                                double uniform, const int32_t* gid, int n,
+                                float* out, std::string* error) {
+    const float u = (float)uniform;
+    if (!std::isfinite(uniform) || !std::isfinite(u) || !(u > 0.0f)) {
+        *error = "uniform phase-field mobility must be finite and positive";
+        return false;
+    }
+    for (int i = 0; i < n; ++i) out[i] = u;
+    return overlay_phase_field_mobility(map, gid, n, out, error);
+}
+
+bool resolve_phase_field_mobility(const SimParams& p, const SimOverrides& ov,
+                                  const PhaseFieldMobilityMap& map,
+                                  bool map_given, CheckpointData* d) {
+    // Case 3: no explicit policy. Stored MOBI values (or the all-0.5 fill of
+    // a pre-MOBI checkpoint, already applied by the reader) stand.
+    if (!ov.phase_field_mobility && !map_given) return true;
+
+    const int n = d->n;
+    std::vector<int32_t> gid((size_t)n);
+    std::vector<float>   mob((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        gid[(size_t)i] = d->cells[(size_t)i].global_id;
+        mob[(size_t)i] = d->cells[(size_t)i].M_pf;
+    }
+    std::string err;
+    bool ok;
+    if (ov.phase_field_mobility) {
+        // Case 1: an explicit uniform rebases every cell, then the map
+        // overrides its listed ids.
+        ok = apply_phase_field_mobility(map, p.phase_field_mobility,
+                                        gid.data(), n, mob.data(), &err);
+    } else {
+        // Case 2: map only. The current parameter record does not store
+        // the writing run's uniform mobility, so unlisted cells must keep
+        // their current per-cell values rather than being rebased to the
+        // compiled default.
+        ok = overlay_phase_field_mobility(map, gid.data(), n, mob.data(),
+                                          &err);
+    }
+    if (!ok) {
+        std::fprintf(stderr, "[fatal] phase-field mobility: %s\n", err.c_str());
+        return false;
+    }
+    for (int i = 0; i < n; ++i) d->cells[(size_t)i].M_pf = mob[(size_t)i];
+    if (ov.phase_field_mobility)
+        std::printf("[ckpt] per-cell phase-field mobility reassigned: uniform "
+                    "M = %.6g, %zu map override(s)%s\n",
+                    p.phase_field_mobility, map.entries.size(),
+                    d->had_mobi ? " (stored values overridden)"
+                                : " (no stored per-cell values)");
+    else
+        std::printf("[ckpt] per-cell phase-field mobility: %zu map "
+                    "override(s) applied over %s\n",
+                    map.entries.size(),
+                    d->had_mobi ? "stored MOBI values"
+                                : "the all-default load (M = 0.5)");
+    return true;
+}
+
 bool checkpoint_write(const CheckpointWriteView& v,
                       const std::vector<std::string>& paths) {
     if (paths.empty()) return true;
@@ -648,12 +833,20 @@ bool checkpoint_write(const CheckpointWriteView& v,
         return false;
     }
     if (v.p->num_cells != v.N || v.p->Nx != v.L || v.p->Ny != v.L ||
-        !validate(*v.p)) {
+        !validate(*v.p, true)) {
         std::fprintf(stderr,
                      "[ckpt] write view and simulation parameters disagree\n");
         return false;
     }
     // The current schema stores the step as int32; reject overflow.
+    std::vector<float> gamma(static_cast<size_t>(v.N));
+    std::vector<float> mobility(static_cast<size_t>(v.N));
+    for (int i = 0; i < v.N; ++i) {
+        gamma[static_cast<size_t>(i)] = v.cell[static_cast<size_t>(i)].gamma;
+        mobility[static_cast<size_t>(i)] = v.cell[static_cast<size_t>(i)].M_pf;
+    }
+    if (!validate_effective_stiffness(*v.p, gamma.data(), mobility.data(), v.N))
+        return false;
     if (v.step < 0 || v.step > 2147483647LL) {
         std::fprintf(stderr,
             "[ckpt] step %lld exceeds the checkpoint int32 field; checkpoint "
@@ -800,7 +993,8 @@ bool checkpoint_write(const CheckpointWriteView& v,
     if (!emit(ckpt::MAGIC_POLR, &CellState::theta) ||
         !emit(ckpt::MAGIC_GAMA, &CellState::gamma) ||
         !emit(ckpt::MAGIC_VA_A, &CellState::v_A) ||
-        !emit(ckpt::MAGIC_RADI, &CellState::R_tgt)) {
+        !emit(ckpt::MAGIC_RADI, &CellState::R_tgt) ||
+        !emit(ckpt::MAGIC_MOBI, &CellState::M_pf)) {
         w.discard();
         return false;
     }
